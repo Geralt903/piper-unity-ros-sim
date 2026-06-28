@@ -1,0 +1,218 @@
+# Piper Unity ROS2 Simulation
+
+Unity 里的 Piper 机械臂仿真控制工程。当前目标是先把 Unity 仿真抽象成和真实机械臂接近的控制接口：使能/失能、回零、关节角度、速度百分比、状态机状态、ROS2 topic、MoveIt trajectory action。以后接真实机械臂时，可以把同一套上层控制切到 SDK/真实 MoveIt 后端。
+
+## 当前状态
+
+- Unity 使用 URDF Importer 导入 Piper 机械臂。
+- 最底部基座固定，不会 Play 后掉下去。
+- Unity 侧有 ROS2 topic bridge。
+- ROS TCP 连接地址默认是 `127.0.0.1:10000`。
+- MoveIt 通过 action bridge 控制 Unity 仿真。
+- 菜单脚本支持启动 endpoint、MoveIt/RViz、使能、失能、回零、设置速度、设置 6 轴角度、查看/实时监看 topic。
+
+已验证的 ROS 通道：
+
+- `/enable_cmd` (`std_msgs/msg/Bool`)
+- `/joint_ctrl_cmd` (`sensor_msgs/msg/JointState`)
+- `/joint_states_feedback` (`sensor_msgs/msg/JointState`)
+- `/joint_states` (`sensor_msgs/msg/JointState`)
+- `/arm_status` (`piper_msgs/msg/PiperStatusMsg`)
+- `/arm_controller/follow_joint_trajectory`
+- `/gripper_controller/follow_joint_trajectory`
+
+## 目录
+
+```text
+Assets/Scripts/
+  PiperArmController.cs              Unity 机械臂控制入口
+  PiperUnityArticulationBackend.cs   Unity ArticulationBody 后端
+  PiperRosTopicBridge.cs             ROS topic 发布/订阅桥
+  PiperControlSystem.cs              控制系统封装入口
+  PiperKeyboardController.cs         键盘测试控制
+  RosMessages/Piper/msg/             Unity 侧 Piper 自定义消息
+
+tools/
+  piper_unity_menu.sh                交互菜单
+  piper_moveit_to_unity_bridge.py    MoveIt action -> Unity topic 桥
+```
+
+## 前置条件
+
+本工程依赖已有 ROS 工作区：
+
+```text
+/home/Light/Projects/Osw_Surf_VR/code/piper_ros
+```
+
+菜单脚本默认把它映射到容器内：
+
+```text
+/ws/piper_ros
+```
+
+默认 Docker 镜像：
+
+```text
+piper-ros:humble
+```
+
+ROS TCP Endpoint 需要在 Humble 工作区内存在并已 build：
+
+```text
+/home/Light/Projects/Osw_Surf_VR/code/piper_ros/src/ros_tcp_endpoint
+```
+
+Unity 必须是 ROS2 模式。当前项目已设置：
+
+```text
+UNITY_MCP_READY;ROS2
+```
+
+如果 Unity Console 出现下面错误，说明又切回了 ROS1：
+
+```text
+Incompatible protocol: ROS-TCP-Endpoint is using ROS2, but Unity is in ROS1 mode.
+```
+
+处理方式：Unity 菜单 `Robotics/ROS Settings` 里把 `Protocol` 切到 `ROS2`，等待重新编译，然后重启 Play。
+
+## 启动
+
+从 Unity 工程根目录运行：
+
+```bash
+./tools/piper_unity_menu.sh --docker
+```
+
+推荐顺序：
+
+```text
+1) 启动 ROS TCP Endpoint
+2) 启动 MoveIt -> Unity action bridge
+3) 启动 MoveIt RViz
+4) 使能 Unity 机械臂
+6) 回零
+```
+
+重要：先启动 ROS TCP Endpoint，再启动 Unity Play。若 Unity 先进入 Play 并连接失败，停止 Play 后重新 Play。
+
+## 菜单功能
+
+```text
+1) 启动 ROS TCP Endpoint
+2) 启动 MoveIt -> Unity action bridge
+3) 启动 MoveIt RViz
+4) 使能 Unity 机械臂
+5) 失能 Unity 机械臂
+6) 回零
+7) 设置速度百分比
+8) 设置 6 关节角度 deg
+9) 查看一次 arm_status
+10) 查看 Piper topic
+11) 实时监看 topic 值
+q) 退出
+```
+
+## 手动测试
+
+使能：
+
+```bash
+ros2 topic pub --once /enable_cmd std_msgs/msg/Bool "{data: true}"
+```
+
+回零：
+
+```bash
+ros2 topic pub --once /joint_ctrl_cmd sensor_msgs/msg/JointState \
+  "{name: [joint1, joint2, joint3, joint4, joint5, joint6, gripper], position: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], velocity: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 30.0], effort: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]}"
+```
+
+发一个 action 目标：
+
+```bash
+ros2 action send_goal /arm_controller/follow_joint_trajectory control_msgs/action/FollowJointTrajectory \
+  "{trajectory: {joint_names: [joint1, joint2, joint3, joint4, joint5, joint6], points: [{positions: [0.0, 0.2, -0.2, 0.0, 0.0, 0.0], time_from_start: {sec: 1, nanosec: 0}}]}}"
+```
+
+查看反馈：
+
+```bash
+ros2 topic echo --once /joint_states_feedback sensor_msgs/msg/JointState
+ros2 topic echo --once /arm_status piper_msgs/msg/PiperStatusMsg
+```
+
+## MoveIt 桥接说明
+
+`tools/piper_moveit_to_unity_bridge.py` 提供：
+
+- `/arm_controller/follow_joint_trajectory` action server
+- `/gripper_controller/follow_joint_trajectory` action server
+- `/joint_ctrl_cmd` publisher
+- `/enable_cmd` publisher
+- `/joint_states_feedback` subscriber
+- `/joint_states` publisher
+
+桥接脚本会以 50 Hz 发布 `/joint_states`，并使用当前 ROS 时间戳。这样 MoveIt 不会因为 Unity feedback 时间戳是 Unity 相对时间而报：
+
+```text
+latest received state has time 0.000000
+Failed to validate trajectory
+```
+
+如果 Unity 有 `/joint_states_feedback`，桥接会用 Unity 的真实反馈覆盖内部状态；如果 Unity 暂时没反馈，则用最后命令状态兜底。
+
+## 常见问题
+
+### Unity 连接被拒绝
+
+Console 出现：
+
+```text
+Connection to 127.0.0.1:10000 failed - Connection refused
+```
+
+说明 Unity Play 时 endpoint 没启动。先在菜单里执行 `1`，再重启 Unity Play。
+
+### RViz 空白
+
+确认使用菜单 `3` 启动的是：
+
+```text
+piper_moveit.launch.py use_sim_time:=false
+```
+
+不要使用旧的 `demo.launch.py` fake controller，否则 RViz 显示成功但 Unity 不会动。
+
+### MoveIt 执行成功但 Unity 不动
+
+检查：
+
+```bash
+ros2 topic echo --once /joint_ctrl_cmd sensor_msgs/msg/JointState
+ros2 topic echo --once /joint_states_feedback sensor_msgs/msg/JointState
+```
+
+如果 `/joint_ctrl_cmd` 有数据但 `/joint_states_feedback` 没有，通常是 Unity 没连上 endpoint 或 Unity 仍在 ROS1 模式。
+
+### ROS2 daemon 异常
+
+如果 `ros2 topic echo` 报 `rclpy.ok()` 相关异常：
+
+```bash
+ros2 daemon stop
+ros2 daemon start
+```
+
+## 保存注意
+
+这个仓库只保存 Unity 工程源码、配置、场景、URDF 资源和工具脚本。以下目录是 Unity 生成物，不提交：
+
+- `Library/`
+- `Temp/`
+- `Logs/`
+- `UserSettings/`
+- `Build/`
+- `Builds/`
+
