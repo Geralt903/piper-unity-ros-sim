@@ -32,6 +32,8 @@ public sealed class PiperRosTopicBridge : MonoBehaviour
 
     private void Start()
     {
+        nextPublishTime = 0f;
+
         if (!connectOnStart)
             return;
 
@@ -50,13 +52,16 @@ public sealed class PiperRosTopicBridge : MonoBehaviour
     {
         ros = ROSConnection.GetOrCreateInstance();
 
-        if (publishJointFeedback)
+        var jointFeedbackState = ros.GetTopic(jointFeedbackTopic);
+        var armStatusState = ros.GetTopic(armStatusTopic);
+
+        if (publishJointFeedback && (jointFeedbackState == null || !jointFeedbackState.IsPublisher))
             ros.RegisterPublisher<JointStateMsg>(jointFeedbackTopic);
-        if (publishArmStatus)
+        if (publishArmStatus && (armStatusState == null || !armStatusState.IsPublisher))
             ros.RegisterPublisher<PiperStatusMsg>(armStatusTopic);
-        if (acceptJointCommands)
+        if (acceptJointCommands && !ros.HasSubscriber(jointCommandTopic))
             ros.Subscribe<JointStateMsg>(jointCommandTopic, OnJointCommand);
-        if (acceptEnableCommands)
+        if (acceptEnableCommands && !ros.HasSubscriber(enableCommandTopic))
             ros.Subscribe<BoolMsg>(enableCommandTopic, OnEnableCommand);
     }
 

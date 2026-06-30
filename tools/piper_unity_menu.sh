@@ -26,7 +26,22 @@ run_docker() {
     xhost +local:docker >/dev/null 2>&1 || true
   fi
 
-  docker run --rm -it \
+  local tty_args=(-i)
+  if [[ -t 0 && -t 1 ]]; then
+    tty_args=(-it)
+  fi
+
+  if docker ps --format '{{.Names}}' | grep -qx 'piper_unity_humble'; then
+    docker exec "${tty_args[@]}" \
+      -e UNITY_ROS_IP="${UNITY_ROS_IP}" \
+      -e UNITY_ROS_PORT="${UNITY_ROS_PORT}" \
+      -w /ws/piper_ros \
+      piper_unity_humble \
+      bash -lc "/surf/tools/piper_unity_menu.sh --inside"
+    return
+  fi
+
+  docker run --rm "${tty_args[@]}" \
     --name piper_unity_humble \
     --network host \
     --privileged \
@@ -107,6 +122,16 @@ start_ros_tcp_endpoint() {
 }
 
 start_moveit() {
+  _start_moveit_common piper_moveit.launch.py "MoveIt（含 RViz）"
+}
+
+start_moveit_headless() {
+  _start_moveit_common move_group.launch.py "MoveIt move_group（无 RViz）"
+}
+
+_start_moveit_common() {
+  local launch_file="$1"
+  local label="$2"
   local package="piper_with_gripper_moveit"
   local log_file="/tmp/piper_moveit_$(date +%Y%m%d_%H%M%S).log"
   read -r -p "启动有夹爪 MoveIt? [Y/n] " answer
@@ -119,21 +144,25 @@ start_moveit() {
     sleep 1
   fi
 
-  LC_NUMERIC=en_US.UTF-8 ros2 launch "${package}" piper_moveit.launch.py use_sim_time:=false >"${log_file}" 2>&1 &
+  LC_NUMERIC=en_US.UTF-8 ros2 launch "${package}" "${launch_file}" use_sim_time:=false >"${log_file}" 2>&1 &
   CHILD_PIDS+=("$!")
-  echo "MoveIt 已启动: ${package}/piper_moveit.launch.py pid=${CHILD_PIDS[-1]}"
+  echo "${label} 已启动: ${package}/${launch_file} pid=${CHILD_PIDS[-1]}"
   echo "日志: ${log_file}"
-  echo "如果 RViz 窗口没有出现，先看日志: tail -f ${log_file}"
+  if [[ "${launch_file}" == "piper_moveit.launch.py" ]]; then
+    echo "如果 RViz 窗口没有出现，先看日志: tail -f ${log_file}"
+  else
+    echo "查看日志: tail -f ${log_file}"
+  fi
 }
 
 start_moveit_to_unity_bridge() {
-  python3 /surf/tools/piper_moveit_to_unity_bridge.py &
+  python3 "${SURF_ROOT}/tools/piper_moveit_to_unity_bridge.py" &
   CHILD_PIDS+=("$!")
   echo "MoveIt -> Unity action bridge 已启动 pid=${CHILD_PIDS[-1]}"
 }
 
 show_topics() {
-  ros2 topic list | grep -E '(^/joint_ctrl_cmd$|^/joint_states_feedback$|^/arm_status$|^/enable_cmd$)' || true
+  ros2 topic list | grep -E '(^/joint_ctrl_cmd$|^/joint_states_feedback$|^/joint_states$|^/arm_status$|^/enable_cmd$|^/link6_pose$)' || true
 }
 
 echo_status_once() {
@@ -172,6 +201,76 @@ monitor_topic_hz() {
   set -e
 }
 
+find_free_port() {
+  local preferred="$1"
+  python3 - "${preferred}" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+for candidate in range(port, port + 100):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", candidate))
+        except OSError:
+            continue
+        print(candidate)
+        raise SystemExit(0)
+
+raise SystemExit(f"no free port found from {port} to {port + 99}")
+PY
+}
+
+start_web_pose_server() {
+  local host="${WEB_POSE_HOST:-0.0.0.0}"
+  local requested_port="${WEB_POSE_PORT:-8765}"
+  local port
+
+  port="$(find_free_port "${requested_port}")"
+  if [[ "${port}" != "${requested_port}" ]]; then
+    echo "端口 ${requested_port} 已被占用，改用 ${port}。"
+  fi
+
+  python3 "${SURF_ROOT}/tools/piper_web_pose_server.py" --host "${host}" --port "${port}" &
+  CHILD_PIDS+=("$!")
+  echo "Web 位姿控制服务器已启动: http://${host}:${port} pid=${CHILD_PIDS[-1]}"
+  echo "本机浏览器通常打开: http://localhost:${port}"
+  echo "保持这个菜单窗口打开；退出菜单会停止 Web 服务。"
+  echo "页面会检查 /link6_pose、/joint_states、/joint_states_feedback、/arm_status。"
+  echo "如需指定端口，可设置环境变量 WEB_POSE_PORT，例如 WEB_POSE_PORT=8766 tools/piper_unity_menu.sh"
+}
+
+start_fk_publisher() {
+  python3 "${SURF_ROOT}/tools/piper_fk_publisher.py" &
+  CHILD_PIDS+=("$!")
+  echo "FK 坐标发布器已启动 pid=${CHILD_PIDS[-1]}"
+  echo "发布 /link6_pose 话题 (base_link → link6 正运动学)。"
+}
+
+run_pose_planner_interactive() {
+  local x y z roll pitch yaw planner
+
+  read -r -p "输入目标位置 x y z (米)，用空格分隔: " x y z
+  if [[ -z "${x}" || -z "${y}" || -z "${z}" ]]; then
+    echo "需要提供 x y z 三个坐标"
+    return 1
+  fi
+
+  read -r -p "输入姿态 roll pitch yaw (度)，用空格分隔，默认 0 0 0: " roll pitch yaw
+  roll="${roll:-0.0}"
+  pitch="${pitch:-0.0}"
+  yaw="${yaw:-0.0}"
+
+  read -r -p "规划器 (默认 RRT): " planner
+  planner="${planner:-RRT}"
+
+  python3 "${SURF_ROOT}/tools/piper_moveit_pose_planner.py" \
+    --x "${x}" --y "${y}" --z "${z}" \
+    --roll "${roll}" --pitch "${pitch}" --yaw "${yaw}" \
+    --planner "${planner}"
+}
+
 monitor_custom_topic() {
   local topic
   local msg_type
@@ -191,25 +290,113 @@ monitor_menu() {
     echo
     echo "实时监看:"
     echo "  1) /arm_status"
-    echo "  2) /joint_states_feedback"
-    echo "  3) /joint_ctrl_cmd"
-    echo "  4) /enable_cmd"
-    echo "  5) /joint_states_feedback 频率"
-    echo "  6) 自定义 topic"
+    echo "  2) /joint_states"
+    echo "  3) /joint_states_feedback"
+    echo "  4) /link6_pose"
+    echo "  5) /joint_ctrl_cmd"
+    echo "  6) /enable_cmd"
+    echo "  7) /joint_states 频率"
+    echo "  8) 自定义 topic"
     echo "  b) 返回主菜单"
     read -r -p "> " choice
 
     case "${choice}" in
       1) monitor_topic /arm_status piper_msgs/msg/PiperStatusMsg ;;
-      2) monitor_topic /joint_states_feedback sensor_msgs/msg/JointState ;;
-      3) monitor_topic /joint_ctrl_cmd sensor_msgs/msg/JointState ;;
-      4) monitor_topic /enable_cmd std_msgs/msg/Bool ;;
-      5) monitor_topic_hz /joint_states_feedback ;;
-      6) monitor_custom_topic ;;
+      2) monitor_topic /joint_states sensor_msgs/msg/JointState ;;
+      3) monitor_topic /joint_states_feedback sensor_msgs/msg/JointState ;;
+      4) monitor_topic /link6_pose geometry_msgs/msg/PoseStamped ;;
+      5) monitor_topic /joint_ctrl_cmd sensor_msgs/msg/JointState ;;
+      6) monitor_topic /enable_cmd std_msgs/msg/Bool ;;
+      7) monitor_topic_hz /joint_states ;;
+      8) monitor_custom_topic ;;
       b|B|back) break ;;
       *) echo "未知选项" ;;
     esac
   done
+}
+
+arm_control_menu() {
+  while true; do
+    echo
+    echo "机械臂控制:"
+    echo "  1) 使能"
+    echo "  2) 失能"
+    echo "  3) 回零"
+    echo "  4) 设置速度百分比"
+    echo "  5) 设置 6 关节角度 deg"
+    echo "  b) 返回主菜单"
+    read -r -p "> " choice
+
+    case "${choice}" in
+      1) publish_enable true ;;
+      2) publish_enable false ;;
+      3) home_arm ;;
+      4)
+        read -r -p "速度百分比 1-100: " SPEED_PERCENT
+        echo "速度已设为 ${SPEED_PERCENT}%"
+        ;;
+      5)
+        radians="$(set_all_joints_degrees)"
+        publish_joint_command "${radians}"
+        ;;
+      b|B|back) break ;;
+      *) echo "未知选项" ;;
+    esac
+  done
+}
+
+debug_menu() {
+  while true; do
+    echo
+    echo "检查/调试:"
+    echo "  1) 查看一次 arm_status"
+    echo "  2) 查看关键 Piper topics"
+    echo "  3) 实时监看 topic 值"
+    echo "  b) 返回主菜单"
+    read -r -p "> " choice
+
+    case "${choice}" in
+      1) echo_status_once ;;
+      2) show_topics ;;
+      3) monitor_menu ;;
+      b|B|back) break ;;
+      *) echo "未知选项" ;;
+    esac
+  done
+}
+
+service_menu() {
+  while true; do
+    echo
+    echo "服务/高级启动:"
+    echo "  1) ROS TCP Endpoint（Unity 连接）"
+    echo "  2) MoveIt RViz（自动带 action bridge）"
+    echo "  3) MoveIt move_group 无 RViz（自动带 action bridge）"
+    echo "  4) MoveIt -> Unity action bridge"
+    echo "  5) FK 坐标发布器（/link6_pose）"
+    echo "  6) Web 坐标控制页面"
+    echo "  b) 返回主菜单"
+    read -r -p "> " choice
+
+    case "${choice}" in
+      1) start_ros_tcp_endpoint ;;
+      2) start_moveit ;;
+      3) start_moveit_headless ;;
+      4) start_moveit_to_unity_bridge ;;
+      5) start_fk_publisher ;;
+      6) start_web_pose_server ;;
+      b|B|back) break ;;
+      *) echo "未知选项" ;;
+    esac
+  done
+}
+
+quick_start() {
+  echo "启动基础链路：Endpoint + action bridge + FK。"
+  echo "Endpoint 启动后请让 Unity 进入 Play；如果 Unity 已连接失败，停止后重新 Play。"
+  start_ros_tcp_endpoint
+  start_moveit_to_unity_bridge
+  start_fk_publisher
 }
 
 menu_loop() {
@@ -220,38 +407,26 @@ menu_loop() {
 
   while true; do
     echo
-    echo "1) 启动 ROS TCP Endpoint"
-    echo "2) 启动 MoveIt -> Unity action bridge"
-    echo "3) 启动 MoveIt RViz"
-    echo "4) 使能 Unity 机械臂"
-    echo "5) 失能 Unity 机械臂"
-    echo "6) 回零"
-    echo "7) 设置速度百分比"
-    echo "8) 设置 6 关节角度 deg"
-    echo "9) 查看一次 arm_status"
-    echo "10) 查看 Piper topic"
-    echo "11) 实时监看 topic 值"
-    echo "q) 退出"
+    echo "常用顺序：1 -> Unity Play -> 2 或 3"
+    echo
+    echo "  1) 快速启动基础链路"
+    echo "  2) 启动 MoveIt RViz"
+    echo "  3) 启动 Web 坐标控制页面"
+    echo "  4) MoveIt RRT 位姿规划"
+    echo "  5) 机械臂控制"
+    echo "  6) 检查/调试"
+    echo "  7) 服务/高级启动"
+    echo "  q) 退出"
     read -r -p "> " choice
 
     case "${choice}" in
-      1) start_ros_tcp_endpoint ;;
-      2) start_moveit_to_unity_bridge ;;
-      3) start_moveit ;;
-      4) publish_enable true ;;
-      5) publish_enable false ;;
-      6) home_arm ;;
-      7)
-        read -r -p "速度百分比 1-100: " SPEED_PERCENT
-        echo "速度已设为 ${SPEED_PERCENT}%"
-        ;;
-      8)
-        radians="$(set_all_joints_degrees)"
-        publish_joint_command "${radians}"
-        ;;
-      9) echo_status_once ;;
-      10) show_topics ;;
-      11) monitor_menu ;;
+      1) quick_start ;;
+      2) start_moveit ;;
+      3) start_web_pose_server ;;
+      4) run_pose_planner_interactive ;;
+      5) arm_control_menu ;;
+      6) debug_menu ;;
+      7) service_menu ;;
       q|Q|quit|exit) break ;;
       *) echo "未知选项" ;;
     esac

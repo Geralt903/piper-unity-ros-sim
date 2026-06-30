@@ -48,4 +48,12 @@ __pycache__/
 # Local agent/tooling state
 .agents/
 .codex/
+.omo/
+tools/.omo/
 moveit2_ws/
+
+# Unity recovery / generated screenshots
+Assets/_Recovery/
+Assets/_Recovery.meta
+Assets/Screenshots/screenshot-*.png
+Assets/Screenshots/screenshot-*.png.meta

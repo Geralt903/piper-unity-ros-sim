@@ -88,11 +88,10 @@ Incompatible protocol: ROS-TCP-Endpoint is using ROS2, but Unity is in ROS1 mode
 推荐顺序：
 
 ```text
-1) 启动 ROS TCP Endpoint
-2) 启动 MoveIt -> Unity action bridge
-3) 启动 MoveIt RViz
-4) 使能 Unity 机械臂
-6) 回零
+1) 快速启动基础链路
+Unity Play
+2) 启动 MoveIt RViz，或 3) 启动 Web 坐标控制页面
+5) 机械臂控制 -> 使能 / 回零
 ```
 
 重要：先启动 ROS TCP Endpoint，再启动 Unity Play。若 Unity 先进入 Play 并连接失败，停止 Play 后重新 Play。
@@ -100,19 +99,19 @@ Incompatible protocol: ROS-TCP-Endpoint is using ROS2, but Unity is in ROS1 mode
 ## 菜单功能
 
 ```text
-1) 启动 ROS TCP Endpoint
-2) 启动 MoveIt -> Unity action bridge
-3) 启动 MoveIt RViz
-4) 使能 Unity 机械臂
-5) 失能 Unity 机械臂
-6) 回零
-7) 设置速度百分比
-8) 设置 6 关节角度 deg
-9) 查看一次 arm_status
-10) 查看 Piper topic
-11) 实时监看 topic 值
+1) 快速启动基础链路
+2) 启动 MoveIt RViz
+3) 启动 Web 坐标控制页面
+4) MoveIt RRT 位姿规划
+5) 机械臂控制
+6) 检查/调试
+7) 服务/高级启动
 q) 退出
 ```
+
+Web 坐标控制页面提供 XY 拖拽选点和 Z 高度滑条；点击“规划并执行”后，页面把目标 `base_link` 位姿提交给 `piper_moveit_pose_planner.py`，由 MoveIt `/move_action` 做运动学解算、规划和执行，不在 Unity 侧做末端作弊位移。
+页面会每 0.5 秒刷新状态，关节状态优先读取 `/joint_states_feedback`，没有该 topic 时才回退到 `/joint_states`。
+菜单启动 Web 后按输出提示打开 `http://localhost:8765`。如果端口被占用，菜单会自动换到后续空闲端口；保持菜单窗口打开，退出菜单会停止 Web 服务。
 
 ## 手动测试
 
@@ -215,4 +214,3 @@ ros2 daemon start
 - `UserSettings/`
 - `Build/`
 - `Builds/`
-

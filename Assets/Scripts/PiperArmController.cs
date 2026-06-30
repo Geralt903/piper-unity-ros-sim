@@ -42,6 +42,15 @@ public sealed class PiperArmController : MonoBehaviour
     public float LinearDamping => linearDamping;
     public float AngularDamping => angularDamping;
     public float JointFriction => jointFriction;
+    public bool TryGetEndEffectorPose(out Vector3 position, out Quaternion rotation)
+    {
+        if (backend == unityBackend)
+            return unityBackend.TryGetEndEffectorPose(out position, out rotation);
+
+        position = default;
+        rotation = default;
+        return false;
+    }
 
     private void Awake()
     {
@@ -150,5 +159,19 @@ public sealed class PiperArmController : MonoBehaviour
     public void SendEndPose(PiperEndPoseCommand command)
     {
         backend?.SendEndPoseCommand(command);
+    }
+
+    public bool TryMoveEndEffector(Vector3 worldDelta, int iterations = 8, float gain = 0.45f, float maxJointStepDegrees = 2f)
+    {
+        if (backend == unityBackend)
+        {
+            bool moved = unityBackend.TryMoveEndEffector(worldDelta, iterations, gain, maxJointStepDegrees);
+            if (moved && unityBackend.LastCommand != null)
+                targetCommand = unityBackend.LastCommand.Clone();
+
+            return moved;
+        }
+
+        return false;
     }
 }

@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
 
 public sealed class PiperUnityArticulationBackend : IPiperArmBackend
@@ -15,6 +14,7 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
     private ArticulationBody gripperLeft;
     private ArticulationBody gripperRight;
     private ArticulationBody root;
+    private Transform endEffector;
 
     public PiperArmStatus Status => status;
     public PiperJointCommand Feedback => feedback;
@@ -48,7 +48,13 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
                 else if (body.name == "link8")
                     gripperRight = body;
             }
+
+            if (body.name == "link6")
+                endEffector = body.transform;
         }
+
+        if (endEffector == null && revoluteJoints.Count > 0)
+            endEffector = revoluteJoints[revoluteJoints.Count - 1].transform;
 
         feedback.EnsureArrays();
         lastCommand.EnsureArrays();
@@ -156,6 +162,64 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
         status.modeFeedback = (byte)Mathf.Clamp(command.mode2, 0, 255);
         if (status.enabled)
             ApplyGripper((float)command.gripper);
+    }
+
+    public bool TryGetEndEffectorPose(out Vector3 position, out Quaternion rotation)
+    {
+        if (endEffector == null)
+        {
+            position = default;
+            rotation = default;
+            return false;
+        }
+
+        position = endEffector.position;
+        rotation = endEffector.rotation;
+        return true;
+    }
+
+    public bool TryMoveEndEffector(Vector3 worldDelta, int iterations, float gain, float maxJointStepDegrees)
+    {
+        if (!status.enabled || endEffector == null || revoluteJoints.Count == 0 || worldDelta.sqrMagnitude <= 0f)
+            return false;
+
+        Vector3 target = endEffector.position + worldDelta;
+        bool moved = false;
+        int solveIterations = Mathf.Clamp(iterations, 1, 24);
+        float solverGain = Mathf.Clamp(gain, 0.05f, 1f);
+        float maxStepRad = Mathf.Max(0.1f, maxJointStepDegrees) * Mathf.Deg2Rad;
+
+        for (int iteration = 0; iteration < solveIterations; iteration++)
+        {
+            Vector3 error = target - endEffector.position;
+            if (error.sqrMagnitude < 0.000001f)
+                break;
+
+            for (int i = revoluteJoints.Count - 1; i >= 0 && i < JointCount; i--)
+            {
+                ArticulationBody joint = revoluteJoints[i];
+                Vector3 axis = joint.transform.TransformDirection(Vector3.right);
+                Vector3 toEnd = endEffector.position - joint.transform.position;
+                Vector3 jacobian = Vector3.Cross(axis, toEnd);
+                float denominator = jacobian.sqrMagnitude + 0.0001f;
+                float deltaRad = Vector3.Dot(jacobian, error) / denominator;
+                deltaRad = Mathf.Clamp(deltaRad * solverGain, -maxStepRad, maxStepRad);
+                if (Mathf.Abs(deltaRad) < 0.000001f)
+                    continue;
+
+                var drive = joint.xDrive;
+                float targetDegrees = drive.target + deltaRad * Mathf.Rad2Deg;
+                drive.target = ClampToDriveLimits(drive, targetDegrees);
+                drive.targetVelocity = 0f;
+                joint.xDrive = drive;
+                lastCommand.positionRad[i] = drive.target * Mathf.Deg2Rad;
+                moved = true;
+            }
+
+            Physics.SyncTransforms();
+        }
+
+        return moved;
     }
 
     private void ApplyHardDrive(ArticulationBody joint)
