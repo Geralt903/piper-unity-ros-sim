@@ -101,7 +101,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .pose-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
     .preview-wrap { margin-top: 12px; border: 1px solid var(--border); border-radius: 8px; background: #f8fafc; padding: 10px; }
     .preview-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; margin-bottom: 8px; color: var(--muted); font-size: 12px; }
-    #armPreview { width: 100%; height: 340px; display: block; background: #ffffff; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; touch-action: none; cursor: grab; position: relative; }
+    #armPreview { width: 100%; height: 460px; display: block; background: #ffffff; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; touch-action: none; cursor: grab; position: relative; }
     #armPreview.dragging { cursor: grabbing; }
     .metric { border: 1px solid var(--border); border-radius: 6px; padding: 9px; background: white; }
     .metric .label { color: var(--muted); font-size: 12px; }
@@ -251,7 +251,7 @@ HTML_PAGE = """<!DOCTYPE html>
             <span id="previewMeta">--</span>
           </div>
           <div id="armPreview"></div>
-          <p class="hint">预览是基于关节角的 WebGL 3D 模型；拖动旋转视角，滚轮缩放。真实空间位姿以 /link6_pose 数值为准。</p>
+          <p class="hint">输入和 /link6_pose 数值均为 ROS base_link 坐标；WebGL 只在显示层把 ROS XYZ 转为画面坐标，Unity world XYZ 不参与 MoveIt 目标解算。</p>
         </div>
 
         <table class="joint-table">
@@ -531,8 +531,9 @@ HTML_PAGE = """<!DOCTYPE html>
       target: null,
       yaw: -0.85,
       pitch: 0.48,
-      distance: 1.25,
-      userDistance: false,
+      distance: 2.4,
+      viewSize: 1.05,
+      zoomScale: 1,
       dragging: false,
       lastX: 0,
       lastY: 0,
@@ -553,7 +554,7 @@ HTML_PAGE = """<!DOCTYPE html>
       const scene = new THREE.Scene();
       scene.background = new THREE.Color(0xf8fafc);
 
-      const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 10);
+      const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 20);
       const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
       renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -614,8 +615,8 @@ HTML_PAGE = """<!DOCTYPE html>
       });
       preview3d.container.addEventListener('wheel', (evt) => {
         evt.preventDefault();
-        preview3d.userDistance = true;
-        preview3d.distance = Math.max(0.55, Math.min(2.6, preview3d.distance + evt.deltaY * 0.0012));
+        preview3d.zoomScale = Math.max(0.45, Math.min(2.4, preview3d.zoomScale + evt.deltaY * 0.0015));
+        resizePreview3D();
         renderPreview3D();
       }, { passive: false });
 
@@ -634,7 +635,13 @@ HTML_PAGE = """<!DOCTYPE html>
       const rect = preview3d.container.getBoundingClientRect();
       const width = Math.max(320, Math.round(rect.width));
       const height = Math.max(260, Math.round(rect.height));
-      preview3d.camera.aspect = width / height;
+      const aspect = width / height;
+      const halfHeight = preview3d.viewSize * preview3d.zoomScale * 0.5;
+      const halfWidth = halfHeight * aspect;
+      preview3d.camera.left = -halfWidth;
+      preview3d.camera.right = halfWidth;
+      preview3d.camera.top = halfHeight;
+      preview3d.camera.bottom = -halfHeight;
       preview3d.camera.updateProjectionMatrix();
       preview3d.renderer.setSize(width, height, false);
       renderPreview3D();
@@ -656,9 +663,18 @@ HTML_PAGE = """<!DOCTYPE html>
       preview3d.renderer.render(preview3d.scene, preview3d.camera);
     }
 
+    function rosToPreviewPoint(ros) {
+      return {
+        x: -ros.y,
+        y: ros.z,
+        z: ros.x,
+        ros,
+      };
+    }
+
     function makeRobotPoints(joints) {
       const q = Array.from({length: 6}, (_, index) => Number.isFinite(joints[index]) ? joints[index] : 0);
-      const points = [{x: 0, y: 0, z: 0}];
+      const rosPoints = [{x: 0, y: 0, z: 0}];
       const baseYaw = q[0];
       const planarAngles = [
         Math.PI / 2 - q[1],
@@ -668,20 +684,20 @@ HTML_PAGE = """<!DOCTYPE html>
         Math.PI / 2 - q[1] - q[2] - q[3] * 0.45 - q[4] * 0.25 - q[5] * 0.18,
       ];
       const lengths = [0.123, 0.285, 0.252, 0.115, 0.08, 0.065];
-      points.push({x: 0, y: lengths[0], z: 0});
+      rosPoints.push({x: 0, y: 0, z: lengths[0]});
       let radial = 0;
       let height = lengths[0];
       for (let i = 1; i < lengths.length; i++) {
         radial += Math.cos(planarAngles[i - 1]) * lengths[i];
         height += Math.sin(planarAngles[i - 1]) * lengths[i];
         const wristYaw = baseYaw + (i >= 4 ? q[5] * 0.12 : 0);
-        points.push({
+        rosPoints.push({
           x: Math.cos(wristYaw) * radial,
-          y: height,
-          z: Math.sin(wristYaw) * radial,
+          y: Math.sin(wristYaw) * radial,
+          z: height,
         });
       }
-      return points;
+      return rosPoints.map(rosToPreviewPoint);
     }
 
     function addCylinderBetween(group, a, b, radius, material) {
@@ -721,11 +737,17 @@ HTML_PAGE = """<!DOCTYPE html>
         (minY + maxY) * 0.5,
         (minZ + maxZ) * 0.5
       );
-      const span = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 0.35);
+      const spanX = maxX - minX;
+      const spanY = maxY - minY;
+      const spanZ = maxZ - minZ;
+      const radius = Math.max(
+        0.34,
+        Math.sqrt(spanX * spanX + spanY * spanY + spanZ * spanZ) * 0.5
+      );
       preview3d.target.copy(center);
-      if (!preview3d.userDistance) {
-        preview3d.distance = Math.max(1.45, span * 2.8);
-      }
+      preview3d.viewSize = Math.max(0.82, radius * 2.75);
+      preview3d.distance = Math.max(2.1, radius * 5.2);
+      resizePreview3D();
     }
 
     function drawPreview(joints, feedback = {}) {
@@ -751,18 +773,19 @@ HTML_PAGE = """<!DOCTYPE html>
         addCylinderBetween(preview3d.armGroup, shadow[i], shadow[i + 1], 0.008, shadowMaterial);
       }
       for (let i = 0; i < points.length - 1; i++) {
-        addCylinderBetween(preview3d.armGroup, points[i], points[i + 1], i < 2 ? 0.022 : 0.017, segmentMaterial);
+        addCylinderBetween(preview3d.armGroup, points[i], points[i + 1], i < 2 ? 0.028 : 0.022, segmentMaterial);
       }
       for (let i = 0; i < points.length; i++) {
-        const geometry = new THREE.SphereGeometry(i === points.length - 1 ? 0.032 : 0.025, 24, 16);
+        const geometry = new THREE.SphereGeometry(i === points.length - 1 ? 0.042 : 0.032, 24, 16);
         const mesh = new THREE.Mesh(geometry, i === points.length - 1 ? tipMaterial : jointMaterial);
         mesh.position.set(points[i].x, points[i].y, points[i].z);
         preview3d.armGroup.add(mesh);
       }
 
       const tip = points[points.length - 1];
+      const rosTip = tip.ros || {x: tip.z, y: -tip.x, z: tip.y};
       preview3d.statusLabel.textContent = hasData
-        ? `${feedback.source || 'joint topic'} ${stale ? 'stale' : 'live'} · 3D · tip x ${fmt(tip.x, 3)} y ${fmt(tip.z, 3)} z ${fmt(tip.y, 3)}`
+        ? `${feedback.source || 'joint topic'} ${stale ? 'stale' : 'live'} · ROS tip x ${fmt(rosTip.x, 3)} y ${fmt(rosTip.y, 3)} z ${fmt(rosTip.z, 3)}`
         : '等待 /joint_states_feedback 或 /joint_states';
       renderPreview3D();
     }
