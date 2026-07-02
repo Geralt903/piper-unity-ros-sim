@@ -61,7 +61,7 @@ HTML_PAGE = """<!DOCTYPE html>
       background: var(--bg);
       color: var(--text);
     }
-    .shell { max-width: 1180px; margin: 0 auto; padding: 24px; }
+    .shell { max-width: 1280px; margin: 0 auto; padding: 18px; }
     header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-end; margin-bottom: 18px; }
     h1 { margin: 0; font-size: 24px; line-height: 1.2; }
     .subtitle { margin-top: 6px; color: var(--muted); font-size: 14px; }
@@ -77,7 +77,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     button.secondary { background: white; color: var(--blue); }
     button:disabled { opacity: 0.55; cursor: wait; }
-    .grid { display: grid; grid-template-columns: minmax(360px, 0.9fr) minmax(420px, 1.1fr); gap: 16px; align-items: start; }
+    .grid { display: grid; grid-template-columns: minmax(340px, 0.85fr) minmax(520px, 1.15fr); gap: 16px; align-items: start; }
     .panel {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -101,7 +101,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .pose-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
     .preview-wrap { margin-top: 12px; border: 1px solid var(--border); border-radius: 8px; background: #f8fafc; padding: 10px; }
     .preview-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; margin-bottom: 8px; color: var(--muted); font-size: 12px; }
-    #armPreview { width: 100%; height: 460px; display: block; background: #ffffff; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; touch-action: none; cursor: grab; position: relative; }
+    #armPreview { width: 100%; height: min(560px, 58vh); min-height: 360px; display: block; background: #ffffff; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; touch-action: none; cursor: grab; position: relative; }
     #armPreview.dragging { cursor: grabbing; }
     .metric { border: 1px solid var(--border); border-radius: 6px; padding: 9px; background: white; }
     .metric .label { color: var(--muted); font-size: 12px; }
@@ -137,6 +137,7 @@ HTML_PAGE = """<!DOCTYPE html>
       header { display: block; }
       .toolbar { margin-top: 12px; }
       .grid, .status-grid, .row, .target-picker { grid-template-columns: 1fr; }
+      #armPreview { height: 420px; min-height: 320px; }
       .z-picker { min-height: auto; justify-items: stretch; }
       .z-picker input[type="range"] { writing-mode: horizontal-tb; width: 100%; height: auto; }
     }
@@ -265,6 +266,7 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/loaders/STLLoader.js"></script>
   <script>
     const form = document.getElementById('poseForm');
     const output = document.getElementById('output');
@@ -527,6 +529,10 @@ HTML_PAGE = """<!DOCTYPE html>
       scene: null,
       camera: null,
       armGroup: null,
+      meshGroup: null,
+      robotMeshes: {},
+      meshesRequested: false,
+      meshesLoaded: false,
       statusLabel: null,
       target: null,
       yaw: -0.85,
@@ -558,6 +564,9 @@ HTML_PAGE = """<!DOCTYPE html>
       const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
       renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.domElement.style.width = '100%';
+      renderer.domElement.style.height = '100%';
+      renderer.domElement.style.display = 'block';
       preview3d.container.appendChild(renderer.domElement);
 
       const hemi = new THREE.HemisphereLight(0xffffff, 0xcbd5e1, 1.8);
@@ -573,18 +582,13 @@ HTML_PAGE = """<!DOCTYPE html>
       const axes = new THREE.AxesHelper(0.45);
       scene.add(axes);
 
-      const base = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.07, 0.08, 0.035, 36),
-        new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.8, metalness: 0.05 })
-      );
-      base.position.y = 0.0175;
-      scene.add(base);
-
       const armGroup = new THREE.Group();
       scene.add(armGroup);
+      const meshGroup = new THREE.Group();
+      scene.add(meshGroup);
 
       preview3d.statusLabel = document.createElement('div');
-      preview3d.statusLabel.style.cssText = 'position:absolute;left:10px;top:8px;padding:3px 6px;border-radius:4px;background:rgba(255,255,255,.82);color:#344054;font:12px system-ui,sans-serif;pointer-events:none;';
+      preview3d.statusLabel.style.cssText = 'position:absolute;left:10px;top:8px;right:10px;padding:4px 7px;border-radius:4px;background:rgba(255,255,255,.86);color:#344054;font:12px system-ui,sans-serif;line-height:1.35;pointer-events:none;white-space:normal;';
       preview3d.container.appendChild(preview3d.statusLabel);
 
       preview3d.container.addEventListener('pointerdown', (evt) => {
@@ -624,8 +628,10 @@ HTML_PAGE = """<!DOCTYPE html>
       preview3d.camera = camera;
       preview3d.renderer = renderer;
       preview3d.armGroup = armGroup;
+      preview3d.meshGroup = meshGroup;
       preview3d.target = new THREE.Vector3(0, 0.24, 0);
       preview3d.ready = true;
+      loadUrdfMeshes();
       resizePreview3D();
       return true;
     }
@@ -665,39 +671,227 @@ HTML_PAGE = """<!DOCTYPE html>
 
     function rosToPreviewPoint(ros) {
       return {
-        x: -ros.y,
+        x: ros.y,
         y: ros.z,
         z: ros.x,
         ros,
       };
     }
 
-    function makeRobotPoints(joints) {
-      const q = Array.from({length: 6}, (_, index) => Number.isFinite(joints[index]) ? joints[index] : 0);
-      const rosPoints = [{x: 0, y: 0, z: 0}];
-      const baseYaw = q[0];
-      const planarAngles = [
-        Math.PI / 2 - q[1],
-        Math.PI / 2 - q[1] - q[2],
-        Math.PI / 2 - q[1] - q[2] - q[3] * 0.45,
-        Math.PI / 2 - q[1] - q[2] - q[3] * 0.45 - q[4] * 0.25,
-        Math.PI / 2 - q[1] - q[2] - q[3] * 0.45 - q[4] * 0.25 - q[5] * 0.18,
-      ];
-      const lengths = [0.123, 0.285, 0.252, 0.115, 0.08, 0.065];
-      rosPoints.push({x: 0, y: 0, z: lengths[0]});
-      let radial = 0;
-      let height = lengths[0];
-      for (let i = 1; i < lengths.length; i++) {
-        radial += Math.cos(planarAngles[i - 1]) * lengths[i];
-        height += Math.sin(planarAngles[i - 1]) * lengths[i];
-        const wristYaw = baseYaw + (i >= 4 ? q[5] * 0.12 : 0);
-        rosPoints.push({
-          x: Math.cos(wristYaw) * radial,
-          y: Math.sin(wristYaw) * radial,
-          z: height,
-        });
+    const urdfJoints = [
+      { name: 'joint1', xyz: [0, 0, 0.123], rpy: [0, 0, 0], axis: [0, 0, 1] },
+      { name: 'joint2', xyz: [0, 0, 0], rpy: [1.5708, -0.10095, -3.1416], axis: [0, 0, 1] },
+      { name: 'joint3', xyz: [0.28503, 0, 0], rpy: [0, 0, -1.759], axis: [0, 0, 1] },
+      { name: 'joint4', xyz: [-0.021984, -0.25075, 0], rpy: [1.5708, 0, 0], axis: [0, 0, 1] },
+      { name: 'joint5', xyz: [0, 0, 0], rpy: [-1.5708, 0, 0], axis: [0, 0, 1] },
+      { name: 'joint6', xyz: [0.000088259, -0.091, 0], rpy: [1.5708, 0, 0], axis: [0, 0, 1] },
+    ];
+    const urdfGripperFingerOrigin = { xyz: [0, 0, 0.1358], rpy: [1.5708, 0, 0] };
+    const urdfMeshSpecs = [
+      { link: 'base_link', file: 'base_link.STL', color: 0xe5e7eb },
+      { link: 'link1', file: 'link1.STL', color: 0xc9d2ee },
+      { link: 'link2', file: 'link2.STL', color: 0xc9d2ee },
+      { link: 'link3', file: 'link3.STL', color: 0xc9d2ee },
+      { link: 'link4', file: 'link4.STL', color: 0xc9d2ee },
+      { link: 'link5', file: 'link5.STL', color: 0xc9d2ee },
+      { link: 'link6', file: 'link6.STL', color: 0xe5eaf0 },
+      { link: 'gripper_base', file: 'gripper_base.STL', color: 0xc9d2ee },
+      { link: 'link7', file: 'link7.STL', color: 0x9fb0d8 },
+      { link: 'link8', file: 'link8.STL', color: 0x9fb0d8 },
+    ];
+
+    function matMul(a, b) {
+      const out = new Array(16).fill(0);
+      for (let row = 0; row < 4; row++) {
+        for (let col = 0; col < 4; col++) {
+          for (let k = 0; k < 4; k++) out[row * 4 + col] += a[row * 4 + k] * b[k * 4 + col];
+        }
       }
-      return rosPoints.map(rosToPreviewPoint);
+      return out;
+    }
+
+    function matIdentity() {
+      return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    }
+
+    function matTranslate(x, y, z) {
+      return [1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, z, 0, 0, 0, 1];
+    }
+
+    function matRotX(angle) {
+      const c = Math.cos(angle), s = Math.sin(angle);
+      return [1, 0, 0, 0, 0, c, -s, 0, 0, s, c, 0, 0, 0, 0, 1];
+    }
+
+    function matRotY(angle) {
+      const c = Math.cos(angle), s = Math.sin(angle);
+      return [c, 0, s, 0, 0, 1, 0, 0, -s, 0, c, 0, 0, 0, 0, 1];
+    }
+
+    function matRotZ(angle) {
+      const c = Math.cos(angle), s = Math.sin(angle);
+      return [c, -s, 0, 0, s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    }
+
+    function matRotAxis(axis, angle) {
+      const [x0, y0, z0] = axis;
+      const length = Math.hypot(x0, y0, z0) || 1;
+      const x = x0 / length, y = y0 / length, z = z0 / length;
+      const c = Math.cos(angle), s = Math.sin(angle), t = 1 - c;
+      return [
+        t*x*x + c, t*x*y - s*z, t*x*z + s*y, 0,
+        t*x*y + s*z, t*y*y + c, t*y*z - s*x, 0,
+        t*x*z - s*y, t*y*z + s*x, t*z*z + c, 0,
+        0, 0, 0, 1,
+      ];
+    }
+
+    function matRpy(roll, pitch, yaw) {
+      return matMul(matMul(matRotZ(yaw), matRotY(pitch)), matRotX(roll));
+    }
+
+    function transformPoint(m, point = [0, 0, 0]) {
+      const [x, y, z] = point;
+      return {
+        x: m[0] * x + m[1] * y + m[2] * z + m[3],
+        y: m[4] * x + m[5] * y + m[6] * z + m[7],
+        z: m[8] * x + m[9] * y + m[10] * z + m[11],
+      };
+    }
+
+    function matToThree(m) {
+      const THREE = window.THREE;
+      const out = new THREE.Matrix4();
+      out.set(
+        m[0], m[1], m[2], m[3],
+        m[4], m[5], m[6], m[7],
+        m[8], m[9], m[10], m[11],
+        m[12], m[13], m[14], m[15]
+      );
+      return out;
+    }
+
+    function previewMatrixFromRos(m) {
+      const THREE = window.THREE;
+      const rosToPreview = new THREE.Matrix4().set(
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        1, 0, 0, 0,
+        0, 0, 0, 1
+      );
+      const previewToRos = rosToPreview.clone().invert();
+      return rosToPreview.clone().multiply(matToThree(m)).multiply(previewToRos);
+    }
+
+    function computeRobotState(joints) {
+      const q = Array.from({length: 6}, (_, index) => Number.isFinite(joints[index]) ? joints[index] : 0);
+      const gripperOpening = Number.isFinite(joints[6]) ? Math.max(0, Math.min(0.08, joints[6])) : 0;
+      let transform = matIdentity();
+      const rosPoints = [{x: 0, y: 0, z: 0}];
+      const linkTransforms = { base_link: matIdentity() };
+
+      for (let i = 0; i < urdfJoints.length; i++) {
+        const joint = urdfJoints[i];
+        const [x, y, z] = joint.xyz;
+        const [roll, pitch, yaw] = joint.rpy;
+        transform = matMul(transform, matMul(matTranslate(x, y, z), matRpy(roll, pitch, yaw)));
+        transform = matMul(transform, matRotAxis(joint.axis, q[i]));
+        linkTransforms[`link${i + 1}`] = transform;
+        rosPoints.push(transformPoint(transform));
+      }
+
+      linkTransforms.gripper_base = transform;
+      const [gx, gy, gz] = urdfGripperFingerOrigin.xyz;
+      const [gr, gp, gw] = urdfGripperFingerOrigin.rpy;
+      const fingerRoot = matMul(transform, matMul(matTranslate(gx, gy, gz), matRpy(gr, gp, gw)));
+      rosPoints.push(transformPoint(fingerRoot));
+      linkTransforms.link7 = matMul(fingerRoot, matTranslate(0, 0, gripperOpening * 0.5));
+      linkTransforms.link8 = matMul(
+        matMul(transform, matMul(matTranslate(gx, gy, gz), matRpy(gr, gp, -3.1416))),
+        matTranslate(0, 0, -gripperOpening * 0.5)
+      );
+
+      const fingerLength = 0.0765;
+      rosPoints.push(transformPoint(linkTransforms.link7, [0, -fingerLength, 0]));
+      rosPoints.push(transformPoint(linkTransforms.link8, [0, -fingerLength, 0]));
+
+      return {
+        points: rosPoints.map(rosToPreviewPoint),
+        linkTransforms,
+      };
+    }
+
+    function makeRobotPoints(joints) {
+      return computeRobotState(joints).points;
+    }
+
+    function applyRosLocalToPreviewGeometry(geometry) {
+      const THREE = window.THREE;
+      geometry.applyMatrix4(new THREE.Matrix4().set(
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        1, 0, 0, 0,
+        0, 0, 0, 1
+      ));
+      geometry.computeVertexNormals();
+      geometry.computeBoundingSphere();
+      geometry.computeBoundingBox();
+      return geometry;
+    }
+
+    function loadUrdfMeshes() {
+      if (preview3d.meshesRequested) return;
+      preview3d.meshesRequested = true;
+      const THREE = window.THREE;
+      if (!THREE || !THREE.STLLoader || !preview3d.meshGroup) {
+        preview3d.statusLabel.textContent = 'STLLoader 未加载，使用简化预览';
+        return;
+      }
+
+      const loader = new THREE.STLLoader();
+      let loaded = 0;
+      for (const spec of urdfMeshSpecs) {
+        loader.load(
+          `/urdf/meshes/${spec.file}`,
+          (geometry) => {
+            applyRosLocalToPreviewGeometry(geometry);
+            const material = new THREE.MeshStandardMaterial({
+              color: spec.color,
+              roughness: 0.62,
+              metalness: 0.08,
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.matrixAutoUpdate = false;
+            mesh.castShadow = false;
+            mesh.receiveShadow = true;
+            preview3d.robotMeshes[spec.link] = mesh;
+            preview3d.meshGroup.add(mesh);
+            loaded += 1;
+            preview3d.meshesLoaded = loaded === urdfMeshSpecs.length;
+            updateUrdfMeshes(window.__lastJoints || []);
+            renderPreview3D();
+          },
+          undefined,
+          () => {
+            loaded += 1;
+            preview3d.meshesLoaded = false;
+            updateUrdfMeshes(window.__lastJoints || []);
+          }
+        );
+      }
+    }
+
+    function updateUrdfMeshes(joints) {
+      if (!preview3d.meshGroup || !Object.keys(preview3d.robotMeshes).length) return false;
+      const state = computeRobotState(joints);
+      for (const [link, transform] of Object.entries(state.linkTransforms)) {
+        const mesh = preview3d.robotMeshes[link];
+        if (!mesh) continue;
+        mesh.matrix.copy(previewMatrixFromRos(transform));
+        mesh.matrixWorldNeedsUpdate = true;
+        mesh.visible = true;
+      }
+      return preview3d.meshesLoaded;
     }
 
     function addCylinderBetween(group, a, b, radius, material) {
@@ -745,8 +939,8 @@ HTML_PAGE = """<!DOCTYPE html>
         Math.sqrt(spanX * spanX + spanY * spanY + spanZ * spanZ) * 0.5
       );
       preview3d.target.copy(center);
-      preview3d.viewSize = Math.max(0.82, radius * 2.75);
-      preview3d.distance = Math.max(2.1, radius * 5.2);
+      preview3d.viewSize = Math.max(1.05, radius * 3.35);
+      preview3d.distance = Math.max(2.4, radius * 5.8);
       resizePreview3D();
     }
 
@@ -765,15 +959,25 @@ HTML_PAGE = """<!DOCTYPE html>
       const shadowMaterial = new THREE.MeshBasicMaterial({ color: 0xcbd5e1, transparent: true, opacity: 0.42 });
 
       preview3d.armGroup.clear();
-      const points = makeRobotPoints(joints);
+      const state = computeRobotState(joints);
+      const points = state.points;
+      const usingMeshes = updateUrdfMeshes(joints);
+      preview3d.armGroup.visible = !usingMeshes;
       centerPreviewOnPoints(points);
       const shadow = points.map(point => ({x: point.x, y: 0.006, z: point.z}));
-
-      for (let i = 0; i < shadow.length - 1; i++) {
-        addCylinderBetween(preview3d.armGroup, shadow[i], shadow[i + 1], 0.008, shadowMaterial);
+      const segmentPairs = [];
+      for (let i = 0; i < Math.min(7, points.length - 1); i++) segmentPairs.push([i, i + 1]);
+      if (points.length >= 10) {
+        segmentPairs.push([7, 8], [7, 9]);
+      } else if (points.length > 7) {
+        for (let i = 7; i < points.length - 1; i++) segmentPairs.push([i, i + 1]);
       }
-      for (let i = 0; i < points.length - 1; i++) {
-        addCylinderBetween(preview3d.armGroup, points[i], points[i + 1], i < 2 ? 0.028 : 0.022, segmentMaterial);
+
+      for (const [a, b] of segmentPairs) {
+        addCylinderBetween(preview3d.armGroup, shadow[a], shadow[b], 0.008, shadowMaterial);
+      }
+      for (const [a, b] of segmentPairs) {
+        addCylinderBetween(preview3d.armGroup, points[a], points[b], a < 2 ? 0.028 : 0.022, segmentMaterial);
       }
       for (let i = 0; i < points.length; i++) {
         const geometry = new THREE.SphereGeometry(i === points.length - 1 ? 0.042 : 0.032, 24, 16);
@@ -782,11 +986,22 @@ HTML_PAGE = """<!DOCTYPE html>
         preview3d.armGroup.add(mesh);
       }
 
-      const tip = points[points.length - 1];
-      const rosTip = tip.ros || {x: tip.z, y: -tip.x, z: tip.y};
+      const tip = points.length >= 10
+        ? {
+            x: (points[8].x + points[9].x) * 0.5,
+            y: (points[8].y + points[9].y) * 0.5,
+            z: (points[8].z + points[9].z) * 0.5,
+            ros: {
+              x: (points[8].ros.x + points[9].ros.x) * 0.5,
+              y: (points[8].ros.y + points[9].ros.y) * 0.5,
+              z: (points[8].ros.z + points[9].ros.z) * 0.5,
+            },
+          }
+        : points[points.length - 1];
+      const rosTip = tip.ros || {x: tip.z, y: tip.x, z: tip.y};
       preview3d.statusLabel.textContent = hasData
-        ? `${feedback.source || 'joint topic'} ${stale ? 'stale' : 'live'} · ROS tip x ${fmt(rosTip.x, 3)} y ${fmt(rosTip.y, 3)} z ${fmt(rosTip.z, 3)}`
-        : '等待 /joint_states_feedback 或 /joint_states';
+        ? `${usingMeshes ? 'URDF STL' : 'URDF FK'} · ${feedback.source || 'joint topic'} ${stale ? 'stale' : 'live'} · ROS tip x ${fmt(rosTip.x, 3)} y ${fmt(rosTip.y, 3)} z ${fmt(rosTip.z, 3)}`
+        : (usingMeshes ? 'URDF STL 已加载，等待关节反馈' : '等待 /joint_states_feedback 或 /joint_states');
       renderPreview3D();
     }
 
@@ -954,6 +1169,20 @@ def _run_topic_cli(args: list[str], timeout: float = 2.0) -> subprocess.Complete
 
 
 ROS_ECHO_TIMEOUT = float(os.environ.get("WEB_POSE_ROS_ECHO_TIMEOUT", "2.0"))
+CANONICAL_JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"]
+URDF_MESH_DIR = Path(__file__).resolve().parent.parent / "Assets" / "URDF" / "piper_description" / "meshes"
+URDF_MESH_FILES = {
+    "base_link.STL",
+    "link1.STL",
+    "link2.STL",
+    "link3.STL",
+    "link4.STL",
+    "link5.STL",
+    "link6.STL",
+    "gripper_base.STL",
+    "link7.STL",
+    "link8.STL",
+}
 
 
 def _topic_list() -> tuple[list[str], str]:
@@ -1049,6 +1278,37 @@ def _extract_list(text: str, key: str) -> list[str | float]:
         except ValueError:
             values.append(item)
     return values
+
+
+def _canonical_joint_name(name: object) -> str:
+    value = str(name).strip()
+    return "gripper" if value == "joint7" else value
+
+
+def _normalize_joint_state(names: list[str], positions: list[float]) -> tuple[list[str], list[float]]:
+    by_name: dict[str, float] = {}
+    for index, position in enumerate(positions):
+        if index < len(names):
+            name = _canonical_joint_name(names[index])
+        elif index < len(CANONICAL_JOINT_NAMES):
+            name = CANONICAL_JOINT_NAMES[index]
+        else:
+            name = f"joint_{index + 1}"
+        by_name[name] = float(position)
+
+    normalized_names: list[str] = []
+    normalized_positions: list[float] = []
+    for name in CANONICAL_JOINT_NAMES:
+        if name in by_name:
+            normalized_names.append(name)
+            normalized_positions.append(by_name[name])
+
+    for name, position in by_name.items():
+        if name not in CANONICAL_JOINT_NAMES:
+            normalized_names.append(name)
+            normalized_positions.append(position)
+
+    return normalized_names, normalized_positions
 
 
 def _header_age(text: str) -> float | None:
@@ -1158,7 +1418,8 @@ class RosStatusMonitor:
         with self.lock:
             feedback = dict(self.feedback)
             fallback = dict(self.fallback_feedback)
-            if not feedback.get("ok") and fallback.get("ok"):
+            has_preferred_topic = "/joint_states_feedback" in self.topics
+            if not feedback.get("ok") and fallback.get("ok") and not has_preferred_topic:
                 preferred_error = feedback.get("error")
                 feedback = fallback
                 feedback["preferred_source"] = "/joint_states_feedback"
@@ -1178,13 +1439,17 @@ class RosStatusMonitor:
             }
 
     def _set_joint_state(self, source: str, msg) -> None:
+        names, positions = _normalize_joint_state(
+            [str(value) for value in msg.name],
+            [float(value) for value in msg.position],
+        )
         data = {
             "ok": True,
             "fresh": True,
             "source": source,
             "age_sec": _stamp_age(msg.header.stamp),
-            "names": list(msg.name),
-            "position": [float(value) for value in msg.position],
+            "names": names,
+            "position": positions,
             "received_at": time.time(),
         }
         with self.lock:
@@ -1266,23 +1531,14 @@ def _link_pose_status() -> dict[str, object]:
 def _joint_state_status(topics: list[str]) -> dict[str, object]:
     preferred_source = "/joint_states_feedback"
     fallback_source = "/joint_states"
-    source = preferred_source if preferred_source in topics else fallback_source
+    has_preferred_topic = preferred_source in topics
+    source = preferred_source if has_preferred_topic else fallback_source
     if source not in topics:
         return {"ok": False, "fresh": False, "source": source, "error": f"missing {source}"}
 
     ok, stdout, error = _echo_topic(source)
     preferred_error = error if source == preferred_source and not ok else None
     using_fallback = False
-    if not ok and source == preferred_source and fallback_source in topics:
-        fallback_ok, fallback_stdout, fallback_error = _echo_topic(fallback_source)
-        if fallback_ok:
-            ok = fallback_ok
-            stdout = fallback_stdout
-            error = ""
-            source = fallback_source
-            using_fallback = True
-        else:
-            error = f"{error}; fallback {fallback_source}: {fallback_error}"
 
     if not ok:
         return {
@@ -1297,6 +1553,7 @@ def _joint_state_status(topics: list[str]) -> dict[str, object]:
 
     names = [str(value) for value in _extract_list(stdout, "name")]
     positions = [float(value) for value in _extract_list(stdout, "position") if isinstance(value, float)]
+    names, positions = _normalize_joint_state(names, positions)
     age = _header_age(stdout)
     return {
         "ok": True,
@@ -1432,6 +1689,22 @@ class PoseControlHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _send_file(self, path: Path, content_type: str) -> None:
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            with path.open("rb") as file:
+                while True:
+                    chunk = file.read(1024 * 128)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
@@ -1443,7 +1716,23 @@ class PoseControlHandler(BaseHTTPRequestHandler):
         if path == "/current_pose":
             self._send_current_pose()
             return
+        if path.startswith("/urdf/meshes/"):
+            self._send_urdf_mesh(path)
+            return
         self._send_response("<h1>404 Not Found</h1>", 404)
+
+    def _send_urdf_mesh(self, path: str) -> None:
+        filename = Path(path).name
+        if filename not in URDF_MESH_FILES:
+            self._send_response("<h1>404 Not Found</h1>", 404)
+            return
+
+        mesh_path = URDF_MESH_DIR / filename
+        if not mesh_path.exists() or not mesh_path.is_file():
+            self._send_response("<h1>404 Not Found</h1>", 404)
+            return
+
+        self._send_file(mesh_path, "model/stl")
 
     def _send_current_pose(self) -> None:
         """Return the current link6 pose as JSON via ros2 topic echo."""

@@ -63,8 +63,7 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
             if (i >= revoluteJoints.Count)
                 continue;
 
-            float targetDegrees = revoluteJoints[i].xDrive.target;
-            feedback.positionRad[i] = targetDegrees * Mathf.Deg2Rad;
+            feedback.positionRad[i] = ReadRevolutePositionRad(revoluteJoints[i]);
             lastCommand.positionRad[i] = feedback.positionRad[i];
         }
 
@@ -86,7 +85,7 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
 
         for (int i = 0; i < revoluteJoints.Count && i < JointCount; i++)
         {
-            feedback.positionRad[i] = revoluteJoints[i].xDrive.target * Mathf.Deg2Rad;
+            feedback.positionRad[i] = ReadRevolutePositionRad(revoluteJoints[i]);
             feedback.velocity[i] = 0.0;
             feedback.effort[i] = 0.0;
         }
@@ -272,9 +271,33 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
 
     private float ReadGripperOpening()
     {
-        float left = gripperLeft != null ? Mathf.Abs(gripperLeft.xDrive.target) : 0f;
-        float right = gripperRight != null ? Mathf.Abs(gripperRight.xDrive.target) : 0f;
+        float left = gripperLeft != null ? Mathf.Abs(ReadPrismaticPositionMeters(gripperLeft)) : 0f;
+        float right = gripperRight != null ? Mathf.Abs(ReadPrismaticPositionMeters(gripperRight)) : 0f;
         return left + right;
+    }
+
+    private static float ReadRevolutePositionRad(ArticulationBody joint)
+    {
+        if (joint == null)
+            return 0f;
+
+        var position = joint.jointPosition;
+        if (position.dofCount > 0)
+            return position[0];
+
+        return joint.xDrive.target * Mathf.Deg2Rad;
+    }
+
+    private static float ReadPrismaticPositionMeters(ArticulationBody joint)
+    {
+        if (joint == null)
+            return 0f;
+
+        var position = joint.jointPosition;
+        if (position.dofCount > 0)
+            return position[0];
+
+        return joint.xDrive.target;
     }
 
     private static float ClampToDriveLimits(ArticulationDrive drive, float target)

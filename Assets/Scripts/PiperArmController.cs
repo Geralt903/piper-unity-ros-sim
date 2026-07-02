@@ -59,6 +59,8 @@ public sealed class PiperArmController : MonoBehaviour
         targetCommand.SpeedPercent = DefaultSpeedPercent;
         targetCommand.GripperEffort = GripperEffort;
         backend.Initialize(this);
+        if (backend.LastCommand != null)
+            targetCommand = backend.LastCommand.Clone();
 
         if (initialState == PiperArmRunState.Enabled || autoEnableOnPlay)
             EnableArm();

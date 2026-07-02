@@ -135,7 +135,7 @@ public sealed class PiperRosTopicBridge : MonoBehaviour
         if (arm == null || msg == null)
             return;
 
-        var command = new PiperJointCommand();
+        var command = arm.LastCommand != null ? arm.LastCommand.Clone() : new PiperJointCommand();
         command.EnsureArrays();
 
         for (int i = 0; i < msg.name.Length; i++)
