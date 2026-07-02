@@ -25,8 +25,6 @@ public sealed class RosCoordinateFrame : MonoBehaviour
         headLength = Mathf.Clamp(headLength, 0.02f, axisLength * 0.45f);
         headRadius = Mathf.Max(shaftRadius * 1.5f, headRadius);
         labelSize = Mathf.Max(0.02f, labelSize);
-
-        Rebuild();
     }
 
     [ContextMenu("Rebuild ROS Coordinate Frame")]

@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -32,6 +32,7 @@ STATUS_CACHE: dict[str, object] = {
 }
 STATUS_CACHE_LOCK = threading.Lock()
 ROS_MONITOR = None
+JOG_LOCK = threading.Lock()
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -122,6 +123,19 @@ HTML_PAGE = """<!DOCTYPE html>
     .picker-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 14px; }
     .picker-note { color: var(--muted); font-size: 12px; line-height: 1.4; }
     .checkline { display: flex; align-items: center; gap: 8px; margin: 8px 0 14px; color: #344054; font-size: 14px; }
+    .checkline input { width: 16px; height: 16px; }
+    .orientation-row.disabled { opacity: 0.48; }
+    .orientation-row.disabled input { background: #f1f5f9; }
+    .jog-panel { border: 1px solid var(--border); border-radius: 8px; background: var(--panel-soft); padding: 10px; margin: 4px 0 14px; }
+    .jog-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; margin-bottom: 8px; }
+    .jog-title { font-weight: 650; font-size: 14px; }
+    .jog-status { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .jog-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .jog-card { border: 1px solid var(--border); border-radius: 6px; background: white; padding: 8px; }
+    .jog-card .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-bottom: 7px; }
+    .jog-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .jog-button { padding: 8px 0; font-size: 15px; font-weight: 700; }
+    .jog-settings { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
     .hint { color: var(--muted); font-size: 13px; line-height: 1.45; margin: 8px 0 0; }
     .joint-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
     .joint-table th, .joint-table td { border-bottom: 1px solid var(--border); padding: 7px 6px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -178,6 +192,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="picker-actions">
             <button class="secondary" id="useCurrentBtn" type="button">使用当前位姿</button>
             <button class="secondary" id="centerCurrentBtn" type="button">当前点居中</button>
+            <button class="secondary" id="centerOriginBtn" type="button">原点居中</button>
             <span class="picker-note">拖动画布设置 X/Y，滑条设置 Z；下方数值框会同步，点击“规划并执行”后由 MoveIt 解算和执行。</span>
           </div>
           <div class="row">
@@ -185,7 +200,7 @@ HTML_PAGE = """<!DOCTYPE html>
             <div class="field"><label for="y">Y (m)</label><input type="number" id="y" name="y" step="0.001" value="0.0" required></div>
             <div class="field"><label for="z">Z (m)</label><input type="number" id="z" name="z" step="0.001" value="0.4" required></div>
           </div>
-          <div class="row">
+          <div class="row orientation-row" id="orientationRow">
             <div class="field"><label for="roll">Roll (deg)</label><input type="number" id="roll" name="roll" step="0.1" value="0.0"></div>
             <div class="field"><label for="pitch">Pitch (deg)</label><input type="number" id="pitch" name="pitch" step="0.1" value="0.0"></div>
             <div class="field"><label for="yaw">Yaw (deg)</label><input type="number" id="yaw" name="yaw" step="0.1" value="0.0"></div>
@@ -195,7 +210,26 @@ HTML_PAGE = """<!DOCTYPE html>
             <div class="field"><label for="planning_time">规划时间 (s)</label><input type="number" id="planning_time" name="planning_time" step="0.1" min="0.1" value="5.0"></div>
             <div class="field"><label for="velocity_scaling">速度缩放</label><input type="number" id="velocity_scaling" name="velocity_scaling" step="0.05" min="0.01" max="1.0" value="0.3"></div>
           </div>
-          <label class="checkline"><input type="checkbox" id="position_only" name="position_only" value="1"> 仅约束位置，让 MoveIt 选择可行姿态</label>
+          <label class="checkline"><input type="checkbox" id="position_only" name="position_only" value="1" checked> 末端姿态不限模式</label>
+          <div class="jog-panel">
+            <div class="jog-head">
+              <span class="jog-title">实时控制模式</span>
+              <span id="jogStatus" class="jog-status">待命</span>
+            </div>
+            <div class="jog-grid">
+              <div class="jog-card"><div class="axis"><span>X</span><span>A / D</span></div><div class="jog-buttons"><button class="secondary jog-button" type="button" data-jog-axis="x" data-jog-dir="-1">-</button><button class="secondary jog-button" type="button" data-jog-axis="x" data-jog-dir="1">+</button></div></div>
+              <div class="jog-card"><div class="axis"><span>Y</span><span>S / W</span></div><div class="jog-buttons"><button class="secondary jog-button" type="button" data-jog-axis="y" data-jog-dir="-1">-</button><button class="secondary jog-button" type="button" data-jog-axis="y" data-jog-dir="1">+</button></div></div>
+              <div class="jog-card"><div class="axis"><span>Z</span><span>Q / E</span></div><div class="jog-buttons"><button class="secondary jog-button" type="button" data-jog-axis="z" data-jog-dir="-1">-</button><button class="secondary jog-button" type="button" data-jog-axis="z" data-jog-dir="1">+</button></div></div>
+              <div class="jog-card"><div class="axis"><span>Roll</span><span>I / K</span></div><div class="jog-buttons"><button class="secondary jog-button" type="button" data-jog-axis="roll" data-jog-dir="-1">-</button><button class="secondary jog-button" type="button" data-jog-axis="roll" data-jog-dir="1">+</button></div></div>
+              <div class="jog-card"><div class="axis"><span>Pitch</span><span>J / L</span></div><div class="jog-buttons"><button class="secondary jog-button" type="button" data-jog-axis="pitch" data-jog-dir="-1">-</button><button class="secondary jog-button" type="button" data-jog-axis="pitch" data-jog-dir="1">+</button></div></div>
+              <div class="jog-card"><div class="axis"><span>Yaw</span><span>U / O</span></div><div class="jog-buttons"><button class="secondary jog-button" type="button" data-jog-axis="yaw" data-jog-dir="-1">-</button><button class="secondary jog-button" type="button" data-jog-axis="yaw" data-jog-dir="1">+</button></div></div>
+            </div>
+            <div class="jog-settings">
+              <div class="field"><label for="jog_linear_step">线性步长 (m)</label><input type="number" id="jog_linear_step" step="0.001" min="0.001" max="0.05" value="0.01"></div>
+              <div class="field"><label for="jog_angular_step">角度步长 (deg)</label><input type="number" id="jog_angular_step" step="0.1" min="0.1" max="10" value="2.0"></div>
+              <div class="field"><label for="jog_planning_time">Jog 规划时间 (s)</label><input type="number" id="jog_planning_time" step="0.1" min="0.2" max="5" value="1.0"></div>
+            </div>
+          </div>
           <button id="submitBtn" type="submit">规划并执行</button>
         </form>
         <p class="hint">执行前建议确认：/arm_status 在线、/joint_states_feedback 或真实 /joint_states 有数据、/link6_pose 正在更新。</p>
@@ -282,6 +316,15 @@ HTML_PAGE = """<!DOCTYPE html>
     const rollInput = document.getElementById('roll');
     const pitchInput = document.getElementById('pitch');
     const yawInput = document.getElementById('yaw');
+    const plannerInput = document.getElementById('planner');
+    const velocityScalingInput = document.getElementById('velocity_scaling');
+    const positionOnlyInput = document.getElementById('position_only');
+    const orientationRow = document.getElementById('orientationRow');
+    const centerOriginBtn = document.getElementById('centerOriginBtn');
+    const jogStatus = document.getElementById('jogStatus');
+    const jogLinearStepInput = document.getElementById('jog_linear_step');
+    const jogAngularStepInput = document.getElementById('jog_angular_step');
+    const jogPlanningTimeInput = document.getElementById('jog_planning_time');
     const requiredTopics = ['/link6_pose', '/joint_states_feedback', '/joint_states', '/arm_status', '/joint_ctrl_cmd', '/enable_cmd'];
     const fmt = (value, digits = 4, suffix = '') => Number.isFinite(value) ? value.toFixed(digits) + suffix : '--';
     const deg = value => Number.isFinite(value) ? (value * 180 / Math.PI).toFixed(1) : '--';
@@ -292,11 +335,34 @@ HTML_PAGE = """<!DOCTYPE html>
       el.textContent = text;
     };
     const xyState = {
-      centerX: Number(xInput.value) || 0.3,
-      centerY: Number(yInput.value) || 0.0,
-      range: Number(localStorage.getItem('piper_xy_range_m')) || 0.8,
+      centerX: Number(localStorage.getItem('piper_xy_center_x_m')) || 0.0,
+      centerY: Number(localStorage.getItem('piper_xy_center_y_m')) || 0.0,
+      range: Number(localStorage.getItem('piper_xy_range_m')) || 1.0,
       dragging: false,
     };
+    const jogState = {
+      activeKeys: new Map(),
+      activePointer: null,
+      timer: null,
+      busy: false,
+      pendingAxis: null,
+      pendingDir: 0,
+      lastSentAt: 0,
+    };
+
+    function setXYCenter(x, y) {
+      xyState.centerX = Number.isFinite(x) ? x : 0.0;
+      xyState.centerY = Number.isFinite(y) ? y : 0.0;
+      localStorage.setItem('piper_xy_center_x_m', String(xyState.centerX));
+      localStorage.setItem('piper_xy_center_y_m', String(xyState.centerY));
+      drawXYPad();
+    }
+
+    function updateOrientationMode() {
+      const positionOnly = positionOnlyInput.checked;
+      orientationRow.classList.toggle('disabled', positionOnly);
+      for (const input of [rollInput, pitchInput, yawInput]) input.disabled = positionOnly;
+    }
 
     function targetFromInputs() {
       return {
@@ -307,6 +373,11 @@ HTML_PAGE = """<!DOCTYPE html>
         pitch: Number(pitchInput.value),
         yaw: Number(yawInput.value),
       };
+    }
+
+    function setJogStatus(text, state = 'neutral') {
+      jogStatus.textContent = text;
+      jogStatus.style.color = state === 'bad' ? 'var(--bad)' : (state === 'ok' ? 'var(--good)' : 'var(--muted)');
     }
 
     function setPoseInputs(pose, options = {}) {
@@ -320,10 +391,86 @@ HTML_PAGE = """<!DOCTYPE html>
       if (Number.isFinite(pose.pitch)) pitchInput.value = pose.pitch.toFixed(1);
       if (Number.isFinite(pose.yaw)) yawInput.value = pose.yaw.toFixed(1);
       if (options.center) {
-        xyState.centerX = Number(xInput.value) || xyState.centerX;
-        xyState.centerY = Number(yInput.value) || xyState.centerY;
+        setXYCenter(Number(xInput.value), Number(yInput.value));
+        return;
       }
       drawXYPad();
+    }
+
+    function applyJogToInputs(axis, direction) {
+      const linearStep = Math.max(0.001, Math.min(0.05, Number(jogLinearStepInput.value) || 0.01));
+      const angularStep = Math.max(0.1, Math.min(10, Number(jogAngularStepInput.value) || 2.0));
+      const inputByAxis = { x: xInput, y: yInput, z: zInput, roll: rollInput, pitch: pitchInput, yaw: yawInput };
+      const input = inputByAxis[axis];
+      if (!input) return null;
+
+      if (['roll', 'pitch', 'yaw'].includes(axis) && positionOnlyInput.checked) {
+        positionOnlyInput.checked = false;
+        updateOrientationMode();
+      }
+
+      const step = ['x', 'y', 'z'].includes(axis) ? linearStep : angularStep;
+      const current = Number(input.value) || 0;
+      input.value = (current + direction * step).toFixed(['x', 'y', 'z'].includes(axis) ? 3 : 1);
+      if (axis === 'z') {
+        zRange.value = Math.max(Number(zRange.min), Math.min(Number(zRange.max), Number(zInput.value))).toFixed(3);
+      }
+      drawXYPad();
+      return targetFromInputs();
+    }
+
+    async function sendJog(axis, direction) {
+      if (jogState.busy) {
+        jogState.pendingAxis = axis;
+        jogState.pendingDir = direction;
+        return;
+      }
+
+      const target = applyJogToInputs(axis, direction);
+      if (!target) return;
+
+      jogState.busy = true;
+      jogState.lastSentAt = performance.now();
+      setJogStatus(`${axis} ${direction > 0 ? '+' : '-'} 发送中`);
+      try {
+        const formData = new FormData();
+        for (const [key, value] of Object.entries(target)) formData.set(key, String(value));
+        formData.set('planner', plannerInput.value || '');
+        formData.set('planning_time', String(Math.max(0.2, Math.min(5, Number(jogPlanningTimeInput.value) || 1.0))));
+        formData.set('velocity_scaling', velocityScalingInput.value || '0.3');
+        if (positionOnlyInput.checked) formData.set('position_only', '1');
+
+        const response = await fetch('/api/jog', { method: 'POST', body: formData });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) throw new Error(payload.error || payload.message || 'jog failed');
+        setJogStatus(`完成 ${Math.round(performance.now() - jogState.lastSentAt)} ms`, 'ok');
+      } catch (err) {
+        setJogStatus(err.message, 'bad');
+      } finally {
+        jogState.busy = false;
+        pollStatus();
+        if (jogState.pendingAxis) {
+          const nextAxis = jogState.pendingAxis;
+          const nextDir = jogState.pendingDir;
+          jogState.pendingAxis = null;
+          jogState.pendingDir = 0;
+          sendJog(nextAxis, nextDir);
+        }
+      }
+    }
+
+    function startJog(axis, direction, pointerId = null) {
+      jogState.activePointer = pointerId;
+      sendJog(axis, direction);
+      if (jogState.timer != null) clearInterval(jogState.timer);
+      jogState.timer = setInterval(() => sendJog(axis, direction), 260);
+    }
+
+    function stopJog() {
+      if (jogState.timer != null) clearInterval(jogState.timer);
+      jogState.timer = null;
+      jogState.activePointer = null;
+      if (!jogState.busy) setJogStatus('待命');
     }
 
     function setupPickerCanvas(canvas) {
@@ -405,6 +552,9 @@ HTML_PAGE = """<!DOCTYPE html>
       const half = xyState.range * 0.5;
       ctx.fillText(`X ${fmt(xyState.centerX - half, 2)} ... ${fmt(xyState.centerX + half, 2)} m`, 10, 20);
       ctx.fillText(`Y ${fmt(xyState.centerY - half, 2)} ... ${fmt(xyState.centerY + half, 2)} m`, 10, 38);
+      ctx.fillStyle = '#1d4ed8';
+      ctx.fillText('+X', size - 28, Math.max(16, origin.py - 8));
+      ctx.fillText('+Y', Math.min(size - 24, origin.px + 8), 18);
       setText('xyReadout', `X ${fmt(target.x, 3)} · Y ${fmt(target.y, 3)}`);
       setText('zReadout', `${fmt(Number(zInput.value), 3)} m`);
     }
@@ -535,7 +685,7 @@ HTML_PAGE = """<!DOCTYPE html>
       meshesLoaded: false,
       statusLabel: null,
       target: null,
-      yaw: -0.85,
+      yaw: Math.PI,
       pitch: 0.48,
       distance: 2.4,
       viewSize: 1.05,
@@ -1048,11 +1198,57 @@ HTML_PAGE = """<!DOCTYPE html>
         output.textContent = '当前点居中失败: ' + err.message;
       }
     });
+    centerOriginBtn.addEventListener('click', () => setXYCenter(0.0, 0.0));
+    positionOnlyInput.addEventListener('change', updateOrientationMode);
+    for (const button of document.querySelectorAll('.jog-button')) {
+      button.addEventListener('pointerdown', (evt) => {
+        evt.preventDefault();
+        button.setPointerCapture(evt.pointerId);
+        startJog(button.dataset.jogAxis, Number(button.dataset.jogDir), evt.pointerId);
+      });
+      button.addEventListener('pointerup', (evt) => {
+        if (button.hasPointerCapture(evt.pointerId)) button.releasePointerCapture(evt.pointerId);
+        stopJog();
+      });
+      button.addEventListener('pointercancel', stopJog);
+      button.addEventListener('pointerleave', () => {
+        if (jogState.activePointer != null) stopJog();
+      });
+    }
+
+    const jogKeyMap = new Map([
+      ['KeyA', ['x', -1]], ['KeyD', ['x', 1]],
+      ['KeyS', ['y', -1]], ['KeyW', ['y', 1]],
+      ['KeyQ', ['z', -1]], ['KeyE', ['z', 1]],
+      ['KeyI', ['roll', -1]], ['KeyK', ['roll', 1]],
+      ['KeyJ', ['pitch', -1]], ['KeyL', ['pitch', 1]],
+      ['KeyU', ['yaw', -1]], ['KeyO', ['yaw', 1]],
+    ]);
+    window.addEventListener('keydown', (evt) => {
+      if (evt.repeat || evt.target instanceof HTMLInputElement) return;
+      const mapping = jogKeyMap.get(evt.code);
+      if (!mapping) return;
+      evt.preventDefault();
+      jogState.activeKeys.set(evt.code, mapping);
+      startJog(mapping[0], mapping[1]);
+    });
+    window.addEventListener('keyup', (evt) => {
+      if (!jogState.activeKeys.has(evt.code)) return;
+      jogState.activeKeys.delete(evt.code);
+      if (jogState.activeKeys.size === 0) {
+        stopJog();
+        return;
+      }
+      const activeMappings = Array.from(jogState.activeKeys.values());
+      const next = activeMappings[activeMappings.length - 1];
+      startJog(next[0], next[1]);
+    });
     refreshBtn.addEventListener('click', pollStatus);
     window.addEventListener('resize', () => {
       drawXYPad();
       drawPreview(window.__lastJoints || [], window.__lastFeedback || {});
     });
+    updateOrientationMode();
     drawXYPad();
     setInterval(pollStatus, 500);
     pollStatus();
@@ -1651,7 +1847,7 @@ def _cached_status_payload() -> dict[str, object]:
     return payload
 
 
-class ReusableHTTPServer(HTTPServer):
+class ReusableHTTPServer(ThreadingHTTPServer):
     """HTTPServer subclass that allows quick restart on the same address."""
 
     allow_reuse_address = True
@@ -1744,8 +1940,71 @@ class PoseControlHandler(BaseHTTPRequestHandler):
         pose = payload.get("pose") or {}
         self._send_json(pose)
 
+    def _handle_jog(self) -> None:
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            self._send_json({"ok": False, "error": "missing request body"}, 400)
+            return
+
+        if not JOG_LOCK.acquire(blocking=False):
+            self._send_json({"ok": False, "error": "jog planner is busy"}, 429)
+            return
+
+        try:
+            length = int(content_length)
+            body = self.rfile.read(length)
+            form = _parse_form(body, self.headers.get("Content-Type", ""))
+            x = _parse_float(form, "x", 0.3)
+            y = _parse_float(form, "y", 0.0)
+            z = _parse_float(form, "z", 0.4)
+            roll = _parse_float(form, "roll", 0.0)
+            pitch = _parse_float(form, "pitch", 0.0)
+            yaw = _parse_float(form, "yaw", 0.0)
+            planner = (form.get("planner") or "").strip()
+            planning_time = _parse_float(form, "planning_time", 1.0)
+            velocity_scaling = _parse_float(form, "velocity_scaling", 0.3)
+            position_only = form.get("position_only") == "1"
+
+            result = _run_planner(
+                x=x,
+                y=y,
+                z=z,
+                roll=roll,
+                pitch=pitch,
+                yaw=yaw,
+                planner=planner,
+                planning_time=planning_time,
+                velocity_scaling=velocity_scaling,
+                position_only=position_only,
+            )
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": f"invalid jog parameter: {exc}"}, 400)
+            return
+        except subprocess.TimeoutExpired:
+            self._send_json({"ok": False, "error": "jog planning timed out"}, 500)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+            return
+        finally:
+            JOG_LOCK.release()
+
+        ok = result.returncode == 0
+        self._send_json(
+            {
+                "ok": ok,
+                "exit_code": result.returncode,
+                "stdout": result.stdout[-3000:],
+                "stderr": result.stderr[-3000:],
+            },
+            200 if ok else 500,
+        )
+
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/jog":
+            self._handle_jog()
+            return
         if path != "/move":
             self._send_response("<h1>404 Not Found</h1>", 404)
             return
