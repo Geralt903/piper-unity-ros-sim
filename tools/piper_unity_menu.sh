@@ -8,6 +8,11 @@ UNITY_ROS_PORT="${UNITY_ROS_PORT:-10000}"
 SPEED_PERCENT="${SPEED_PERCENT:-30}"
 GRIPPER_METERS="${GRIPPER_METERS:-0.0}"
 GRIPPER_EFFORT="${GRIPPER_EFFORT:-1.0}"
+PIPER_CAN_NAME="${PIPER_CAN_NAME:-can_piper}"
+REAL_ARM_SPEED_PERCENT="${REAL_ARM_SPEED_PERCENT:-5}"
+REAL_ARM_MAX_SPEED_DEG="${REAL_ARM_MAX_SPEED_DEG:-8}"
+REAL_ARM_DRY_RUN="${REAL_ARM_DRY_RUN:-0}"
+SKIP_SDK_INSTALL="${SKIP_SDK_INSTALL:-0}"
 
 declare -a CHILD_PIDS=()
 
@@ -159,6 +164,55 @@ start_moveit_to_unity_bridge() {
   python3 "${SURF_ROOT}/tools/piper_moveit_to_unity_bridge.py" &
   CHILD_PIDS+=("$!")
   echo "MoveIt -> Unity action bridge 已启动 pid=${CHILD_PIDS[-1]}"
+}
+
+ensure_piper_sdk_pythonpath() {
+  if [[ "${SKIP_SDK_INSTALL}" == "1" ]]; then
+    if [[ -d /tmp/piper-sdk-site ]]; then
+      export PYTHONPATH="/tmp/piper-sdk-site:${PYTHONPATH:-}"
+    fi
+    return
+  fi
+
+  local sdk_site="/tmp/piper-sdk-site"
+  mkdir -p "${sdk_site}"
+  python3 -m pip install --upgrade --target "${sdk_site}" piper_sdk python-can
+  export PYTHONPATH="${sdk_site}:${PYTHONPATH:-}"
+}
+
+start_real_arm_smooth_bridge() {
+  local can_name speed max_speed dry_run_args=()
+
+  read -r -p "CAN 接口名 [${PIPER_CAN_NAME}]: " can_name
+  can_name="${can_name:-${PIPER_CAN_NAME}}"
+
+  read -r -p "真机速度百分比 [${REAL_ARM_SPEED_PERCENT}]: " speed
+  speed="${speed:-${REAL_ARM_SPEED_PERCENT}}"
+
+  read -r -p "最大关节速度 deg/s [${REAL_ARM_MAX_SPEED_DEG}]: " max_speed
+  max_speed="${max_speed:-${REAL_ARM_MAX_SPEED_DEG}}"
+
+  if [[ "${REAL_ARM_DRY_RUN}" == "1" ]]; then
+    dry_run_args=(--dry-run)
+  else
+    read -r -p "只 dry-run 不发真机命令? [y/N] " answer
+    if [[ "${answer,,}" == "y" ]]; then
+      dry_run_args=(--dry-run)
+    fi
+  fi
+
+  ensure_piper_sdk_pythonpath
+
+  python3 "${SURF_ROOT}/tools/piper_sdk_bridge.py" \
+    --can "${can_name}" \
+    --speed "${speed}" \
+    --max-speed-deg "${max_speed}" \
+    "${dry_run_args[@]}" &
+  CHILD_PIDS+=("$!")
+
+  echo "真机平滑桥已启动 pid=${CHILD_PIDS[-1]}"
+  echo "订阅 /joint_ctrl_cmd 和 /enable_cmd，发布 /joint_states_feedback、/joint_states、/arm_status、/link6_pose。"
+  echo "注意：真机桥运行时，不要同时让 Unity 仿真发布 /joint_states_feedback。"
 }
 
 show_topics() {
@@ -375,6 +429,7 @@ service_menu() {
     echo "  4) MoveIt -> Unity action bridge"
     echo "  5) FK 坐标发布器（/link6_pose）"
     echo "  6) Web 坐标控制页面"
+    echo "  7) 真机平滑桥（piper_sdk -> CAN）"
     echo "  b) 返回主菜单"
     read -r -p "> " choice
 
@@ -385,6 +440,7 @@ service_menu() {
       4) start_moveit_to_unity_bridge ;;
       5) start_fk_publisher ;;
       6) start_web_pose_server ;;
+      7) start_real_arm_smooth_bridge ;;
       b|B|back) break ;;
       *) echo "未知选项" ;;
     esac
@@ -416,6 +472,7 @@ menu_loop() {
     echo "  5) 机械臂控制"
     echo "  6) 检查/调试"
     echo "  7) 服务/高级启动"
+    echo "  8) 启动真机平滑桥"
     echo "  q) 退出"
     read -r -p "> " choice
 
@@ -427,6 +484,7 @@ menu_loop() {
       5) arm_control_menu ;;
       6) debug_menu ;;
       7) service_menu ;;
+      8) start_real_arm_smooth_bridge ;;
       q|Q|quit|exit) break ;;
       *) echo "未知选项" ;;
     esac

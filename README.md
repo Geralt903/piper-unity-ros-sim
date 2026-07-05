@@ -35,6 +35,10 @@ Assets/Scripts/
 tools/
   piper_unity_menu.sh                交互菜单
   piper_moveit_to_unity_bridge.py    MoveIt action -> Unity topic 桥
+  piper_sdk_bridge.py                真机 SDK 平滑控制桥
+  piper_sdk_console.py               Piper SDK/CAN 交互验证工具
+  piper_real_bridge_docker.sh        真机桥 Docker 启动脚本
+  piper_sdk_docker.sh                SDK 验证工具 Docker 启动脚本
 ```
 
 ## 前置条件
@@ -85,6 +89,22 @@ Incompatible protocol: ROS-TCP-Endpoint is using ROS2, but Unity is in ROS1 mode
 ./tools/piper_unity_menu.sh --docker
 ```
 
+### 链路 A：Unity 仿真控制
+
+用于只控制 Unity 里的 ArticulationBody 仿真机械臂。
+
+数据流：
+
+```text
+Web / RViz / MoveIt
+  -> /arm_controller/follow_joint_trajectory
+  -> piper_moveit_to_unity_bridge.py
+  -> /joint_ctrl_cmd
+  -> Unity PiperRosTopicBridge
+  -> Unity ArticulationBody
+  -> /joint_states_feedback /arm_status /link6_pose
+```
+
 推荐顺序：
 
 ```text
@@ -96,6 +116,49 @@ Unity Play
 
 重要：先启动 ROS TCP Endpoint，再启动 Unity Play。若 Unity 先进入 Play 并连接失败，停止 Play 后重新 Play。
 
+### 链路 B：Piper 真机平滑控制
+
+用于 Web/MoveIt 控制真实 Piper。Unity 此时不要同时发布 `/joint_states_feedback`，避免和真机反馈冲突。
+
+数据流：
+
+```text
+Web / RViz / MoveIt
+  -> /arm_controller/follow_joint_trajectory
+  -> piper_moveit_to_unity_bridge.py
+  -> /joint_ctrl_cmd
+  -> piper_sdk_bridge.py
+  -> 平滑关节插值
+  -> piper_sdk
+  -> SocketCAN
+  -> Piper 真机
+  -> /joint_states_feedback /joint_states /arm_status /link6_pose
+```
+
+第一次建议先 dry-run：
+
+```text
+8) 启动真机平滑桥
+CAN 接口名: can0 或 can_piper
+真机速度百分比: 5
+最大关节速度 deg/s: 8
+只 dry-run 不发真机命令: y
+```
+
+确认 `/joint_states_feedback`、`/arm_status`、`/link6_pose` 有数据后，再重新启动真机桥，dry-run 选 `N`。然后：
+
+```text
+7) 服务/高级启动 -> 3) MoveIt move_group 无 RViz
+3) 启动 Web 坐标控制页面
+5) 机械臂控制 -> 1) 使能
+```
+
+也可以直接运行：
+
+```bash
+./tools/piper_real_bridge_docker.sh --can can0 --speed 5 --max-speed-deg 8
+```
+
 ## 菜单功能
 
 ```text
@@ -106,6 +169,7 @@ Unity Play
 5) 机械臂控制
 6) 检查/调试
 7) 服务/高级启动
+8) 启动真机平滑桥
 q) 退出
 ```
 
@@ -161,6 +225,78 @@ Failed to validate trajectory
 ```
 
 如果 Unity 有 `/joint_states_feedback`，桥接会用 Unity 的真实反馈覆盖内部状态；如果 Unity 暂时没反馈，则用最后命令状态兜底。
+
+## 真机 SDK 平滑桥说明
+
+`tools/piper_sdk_bridge.py` 提供：
+
+- `/joint_ctrl_cmd` subscriber
+- `/enable_cmd` subscriber
+- `/joint_states_feedback` publisher
+- `/joint_states` publisher
+- `/arm_status` publisher
+- `/link6_pose` publisher
+- Piper SDK / SocketCAN 真机控制
+- 关节空间平滑插值和命令超时保护
+
+默认安全参数：
+
+```text
+speed_percent = 5
+control_rate = 50 Hz
+max_speed = 8~12 deg/s
+max_step = 1 deg
+command_timeout = 5 s
+```
+
+真机桥不会直接把 MoveIt 目标角度一次性发给 SDK，而是把目标保存在内部，每个控制周期只前进一步：
+
+```text
+当前命令角度 -> 限速/限步 -> 关节限位 clamp -> SDK JointCtrl
+```
+
+零点和方向假设：
+
+```text
+ROS/MoveIt 0 rad = URDF 0 点 = Piper SDK 0 deg
+```
+
+当前版本默认不加 offset，也不反转关节方向。如果实机测试发现某个关节方向或零点不一致，需要在真机桥里加入：
+
+```text
+sdk_deg[i] = joint_direction[i] * ros_deg[i] + joint_offset_deg[i]
+ros_deg[i] = joint_direction[i] * (sdk_deg[i] - joint_offset_deg[i])
+```
+
+限位有三层：
+
+```text
+MoveIt/URDF joint limits
+piper_sdk_bridge.py 软件限位
+piper_sdk 自带 joint/gripper limit
+```
+
+当前软件限位：
+
+```text
+joint1: -150 ~ 150 deg
+joint2:    0 ~ 180 deg
+joint3: -170 ~ 0 deg
+joint4: -100 ~ 100 deg
+joint5:  -70 ~ 70 deg
+joint6: -120 ~ 120 deg
+```
+
+真机第一次测试建议：
+
+```text
+1. dry-run 启动真机桥
+2. 确认 topic 在线
+3. 真机桥 dry-run=N，速度 5%，最大关节速度 8 deg/s
+4. 使能
+5. 先发很小的关节命令，例如 0 5 -5 0 0 0
+6. 确认方向、零点、限位都和 RViz/Unity 一致后，再使用 Web 目标点
+```
 
 ## 常见问题
 
