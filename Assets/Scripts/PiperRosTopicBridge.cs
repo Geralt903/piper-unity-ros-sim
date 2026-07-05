@@ -1,8 +1,10 @@
 using RosMessageTypes.BuiltinInterfaces;
+using RosMessageTypes.Geometry;
 using RosMessageTypes.Piper;
 using RosMessageTypes.Sensor;
 using RosMessageTypes.Std;
 using Unity.Robotics.ROSTCPConnector;
+using Unity.Robotics.ROSTCPConnector.ROSGeometry;
 using UnityEngine;
 
 public sealed class PiperRosTopicBridge : MonoBehaviour
@@ -11,12 +13,16 @@ public sealed class PiperRosTopicBridge : MonoBehaviour
     [SerializeField] private float publishHz = 50f;
     [SerializeField] private bool publishJointFeedback = true;
     [SerializeField] private bool publishArmStatus = true;
+    [SerializeField] private bool publishEndPoseFeedback = true;
     [SerializeField] private bool acceptJointCommands = true;
     [SerializeField] private bool acceptEnableCommands = true;
     [SerializeField] private bool autoEnableOnJointCommand = true;
     [SerializeField] private string jointFeedbackTopic = PiperRosContract.JointFeedbackTopic;
     [SerializeField] private string jointCommandTopic = PiperRosContract.JointCommandTopic;
     [SerializeField] private string armStatusTopic = PiperRosContract.ArmStatusTopic;
+    [SerializeField] private string endPoseFeedbackTopic = PiperRosContract.EndPoseFeedbackTopic;
+    [SerializeField] private string endPoseFrameId = "base_link";
+    [SerializeField] private Transform endPoseReferenceFrame;
     [SerializeField] private string enableCommandTopic = PiperRosContract.EnableCommandTopic;
 
     private PiperArmController arm;
@@ -40,10 +46,11 @@ public sealed class PiperRosTopicBridge : MonoBehaviour
         Connect();
     }
 
-    public void SetRouting(bool publishFeedback, bool publishStatus, bool subscribeJointCommands, bool subscribeEnableCommands)
+    public void SetRouting(bool publishFeedback, bool publishStatus, bool publishEndPose, bool subscribeJointCommands, bool subscribeEnableCommands)
     {
         publishJointFeedback = publishFeedback;
         publishArmStatus = publishStatus;
+        publishEndPoseFeedback = publishEndPose;
         acceptJointCommands = subscribeJointCommands;
         acceptEnableCommands = subscribeEnableCommands;
     }
@@ -54,11 +61,14 @@ public sealed class PiperRosTopicBridge : MonoBehaviour
 
         var jointFeedbackState = ros.GetTopic(jointFeedbackTopic);
         var armStatusState = ros.GetTopic(armStatusTopic);
+        var endPoseFeedbackState = ros.GetTopic(endPoseFeedbackTopic);
 
         if (publishJointFeedback && (jointFeedbackState == null || !jointFeedbackState.IsPublisher))
             ros.RegisterPublisher<JointStateMsg>(jointFeedbackTopic);
         if (publishArmStatus && (armStatusState == null || !armStatusState.IsPublisher))
             ros.RegisterPublisher<PiperStatusMsg>(armStatusTopic);
+        if (publishEndPoseFeedback && (endPoseFeedbackState == null || !endPoseFeedbackState.IsPublisher))
+            ros.RegisterPublisher<PoseStampedMsg>(endPoseFeedbackTopic);
         if (acceptJointCommands && !ros.HasSubscriber(jointCommandTopic))
             ros.Subscribe<JointStateMsg>(jointCommandTopic, OnJointCommand);
         if (acceptEnableCommands && !ros.HasSubscriber(enableCommandTopic))
@@ -75,6 +85,8 @@ public sealed class PiperRosTopicBridge : MonoBehaviour
             PublishJointFeedback();
         if (publishArmStatus)
             PublishArmStatus();
+        if (publishEndPoseFeedback)
+            PublishEndPoseFeedback();
     }
 
     private void PublishJointFeedback()
@@ -128,6 +140,26 @@ public sealed class PiperRosTopicBridge : MonoBehaviour
         };
 
         ros.Publish(armStatusTopic, msg);
+    }
+
+    private void PublishEndPoseFeedback()
+    {
+        if (!arm.TryGetEndEffectorPose(out Vector3 worldPosition, out Quaternion worldRotation))
+            return;
+
+        Transform referenceFrame = endPoseReferenceFrame != null ? endPoseReferenceFrame : arm.transform;
+        Vector3 localPosition = referenceFrame.InverseTransformPoint(worldPosition);
+        Quaternion localRotation = Quaternion.Inverse(referenceFrame.rotation) * worldRotation;
+        PointMsg rosPosition = localPosition.To<FLU>();
+        QuaternionMsg rosRotation = localRotation.To<FLU>();
+
+        var msg = new PoseStampedMsg
+        {
+            header = MakeHeader(endPoseFrameId),
+            pose = new PoseMsg(rosPosition, rosRotation)
+        };
+
+        ros.Publish(endPoseFeedbackTopic, msg);
     }
 
     private void OnJointCommand(JointStateMsg msg)

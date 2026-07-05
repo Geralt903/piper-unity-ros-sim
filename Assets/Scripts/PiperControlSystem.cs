@@ -14,6 +14,7 @@ public sealed class PiperControlSystem : MonoBehaviour
     [SerializeField] private bool enableKeyboardInUnityMode = true;
     [SerializeField] private bool publishUnityFeedback = true;
     [SerializeField] private bool publishUnityArmStatus = true;
+    [SerializeField] private bool publishUnityEndPoseFeedback = true;
     [SerializeField] private bool acceptRosJointCommands = true;
     [SerializeField] private bool acceptRosEnableCommands = true;
 
@@ -101,6 +102,7 @@ public sealed class PiperControlSystem : MonoBehaviour
             rosBridge.SetRouting(
                 publishUnityFeedback && unityAuthority,
                 publishUnityArmStatus && unityAuthority,
+                publishUnityEndPoseFeedback && unityAuthority,
                 acceptRosJointCommands && unityAuthority,
                 acceptRosEnableCommands && unityAuthority);
             rosBridge.enabled = unityAuthority;

@@ -3,6 +3,7 @@ public static class PiperRosContract
     public const string JointFeedbackTopic = "/joint_states_feedback";
     public const string JointCommandTopic = "/joint_ctrl_cmd";
     public const string ArmStatusTopic = "/arm_status";
+    public const string EndPoseFeedbackTopic = "/link6_pose";
     public const string EnableCommandTopic = "/enable_cmd";
     public const string EnableService = "/enable_srv";
     public const string EndPoseCommandTopic = "/pos_cmd";

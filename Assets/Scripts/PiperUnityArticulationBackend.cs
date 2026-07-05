@@ -15,6 +15,8 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
     private ArticulationBody gripperRight;
     private ArticulationBody root;
     private Transform endEffector;
+    private bool hasCartesianTarget;
+    private Vector3 cartesianTargetPosition;
 
     public PiperArmStatus Status => status;
     public PiperJointCommand Feedback => feedback;
@@ -83,6 +85,9 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
     {
         feedback.EnsureArrays();
 
+        if (!status.enabled)
+            hasCartesianTarget = false;
+
         for (int i = 0; i < revoluteJoints.Count && i < JointCount; i++)
         {
             feedback.positionRad[i] = ReadRevolutePositionRad(revoluteJoints[i]);
@@ -136,6 +141,7 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
     {
         command.EnsureArrays();
         lastCommand = command.Clone();
+        hasCartesianTarget = false;
         status.ctrlMode = (byte)Mathf.Clamp(command.mode1, 0, 255);
         status.modeFeedback = (byte)Mathf.Clamp(command.mode2, 0, 255);
 
@@ -182,15 +188,27 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
         if (!status.enabled || endEffector == null || revoluteJoints.Count == 0 || worldDelta.sqrMagnitude <= 0f)
             return false;
 
-        Vector3 target = endEffector.position + worldDelta;
+        if (!hasCartesianTarget || Vector3.Distance(cartesianTargetPosition, endEffector.position) > 0.25f)
+        {
+            cartesianTargetPosition = endEffector.position;
+            hasCartesianTarget = true;
+        }
+
+        cartesianTargetPosition += worldDelta;
+        Vector3 lead = cartesianTargetPosition - endEffector.position;
+        const float maxTargetLeadMeters = 0.08f;
+        if (lead.sqrMagnitude > maxTargetLeadMeters * maxTargetLeadMeters)
+            cartesianTargetPosition = endEffector.position + lead.normalized * maxTargetLeadMeters;
+
         bool moved = false;
         int solveIterations = Mathf.Clamp(iterations, 1, 24);
         float solverGain = Mathf.Clamp(gain, 0.05f, 1f);
         float maxStepRad = Mathf.Max(0.1f, maxJointStepDegrees) * Mathf.Deg2Rad;
+        float[] usedStepRad = new float[JointCount];
 
         for (int iteration = 0; iteration < solveIterations; iteration++)
         {
-            Vector3 error = target - endEffector.position;
+            Vector3 error = cartesianTargetPosition - endEffector.position;
             if (error.sqrMagnitude < 0.000001f)
                 break;
 
@@ -202,23 +220,42 @@ public sealed class PiperUnityArticulationBackend : IPiperArmBackend
                 Vector3 jacobian = Vector3.Cross(axis, toEnd);
                 float denominator = jacobian.sqrMagnitude + 0.0001f;
                 float deltaRad = Vector3.Dot(jacobian, error) / denominator;
-                deltaRad = Mathf.Clamp(deltaRad * solverGain, -maxStepRad, maxStepRad);
+                float remainingStepRad = Mathf.Max(0f, maxStepRad - Mathf.Abs(usedStepRad[i]));
+                if (remainingStepRad <= 0f)
+                    continue;
+
+                deltaRad *= solverGain * CartesianJointWeight(i);
+                deltaRad = Mathf.Clamp(deltaRad, -remainingStepRad, remainingStepRad);
                 if (Mathf.Abs(deltaRad) < 0.000001f)
                     continue;
 
                 var drive = joint.xDrive;
-                float targetDegrees = drive.target + deltaRad * Mathf.Rad2Deg;
+                float previousTargetDegrees = drive.target;
+                float targetDegrees = previousTargetDegrees + deltaRad * Mathf.Rad2Deg;
                 drive.target = ClampToDriveLimits(drive, targetDegrees);
                 drive.targetVelocity = 0f;
                 joint.xDrive = drive;
                 lastCommand.positionRad[i] = drive.target * Mathf.Deg2Rad;
-                moved = true;
+                float appliedDeltaRad = (drive.target - previousTargetDegrees) * Mathf.Deg2Rad;
+                usedStepRad[i] += Mathf.Abs(appliedDeltaRad);
+                moved |= Mathf.Abs(appliedDeltaRad) >= 0.000001f;
             }
 
             Physics.SyncTransforms();
         }
 
         return moved;
+    }
+
+    private static float CartesianJointWeight(int jointIndex)
+    {
+        return jointIndex switch
+        {
+            5 => 0.08f,
+            4 => 0.25f,
+            3 => 0.55f,
+            _ => 1f
+        };
     }
 
     private void ApplyHardDrive(ArticulationBody joint)
