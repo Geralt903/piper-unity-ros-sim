@@ -1,6 +1,6 @@
 # Piper Unity ROS2 Simulation
 
-Unity 里的 Piper 机械臂仿真控制工程。当前目标是先把 Unity 仿真抽象成和真实机械臂接近的控制接口：使能/失能、回零、关节角度、速度百分比、状态机状态、ROS2 topic、MoveIt trajectory action。以后接真实机械臂时，可以把同一套上层控制切到 SDK/真实 MoveIt 后端。
+Unity 里的 Piper 机械臂仿真控制工程。当前目标是把 Unity 仿真抽象成完整的控制接口：使能/失能、回零、关节角度、速度百分比、状态机状态、ROS2 topic、MoveIt trajectory action。
 
 ## 当前状态
 
