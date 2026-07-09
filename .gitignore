@@ -44,6 +44,8 @@ Thumbs.db
 .env.*
 __pycache__/
 *.py[cod]
+node_modules/
+web_control/web_control/web_control.log
 
 # Local agent/tooling state
 .agents/

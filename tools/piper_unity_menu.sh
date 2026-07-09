@@ -286,12 +286,13 @@ start_web_pose_server() {
     echo "端口 ${requested_port} 已被占用，改用 ${port}。"
   fi
 
-  python3 "${SURF_ROOT}/tools/piper_web_pose_server.py" --host "${host}" --port "${port}" &
+  WEB_CONTROL_HOST="${host}" WEB_CONTROL_PORT="${port}" \
+    "${SURF_ROOT}/web_control/web_control/start_web_control.sh" --server-only &
   CHILD_PIDS+=("$!")
-  echo "Web 位姿控制服务器已启动: http://${host}:${port} pid=${CHILD_PIDS[-1]}"
+  echo "Piper Web 控制台已启动: http://${host}:${port} pid=${CHILD_PIDS[-1]}"
   echo "本机浏览器通常打开: http://localhost:${port}"
   echo "保持这个菜单窗口打开；退出菜单会停止 Web 服务。"
-  echo "页面会检查 /link6_pose、/joint_states、/joint_states_feedback、/arm_status。"
+  echo "页面会检查 /link6_pose、/joint_states、/joint_states_feedback、/arm_status，并通过 MoveIt 控制 Unity。"
   echo "如需指定端口，可设置环境变量 WEB_POSE_PORT，例如 WEB_POSE_PORT=8766 tools/piper_unity_menu.sh"
 }
 
