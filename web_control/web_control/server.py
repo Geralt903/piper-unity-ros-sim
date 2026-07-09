@@ -33,6 +33,7 @@ URDF_MESH_DIR = PROJECT_ROOT / "Assets" / "URDF" / "piper_description" / "meshes
 HOST = os.environ.get("WEB_CONTROL_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WEB_CONTROL_PORT", "8765"))
 FRAME_ID = os.environ.get("FRAME_ID", "base_link")
+MOVEIT_PLANNING_FRAME_ID = os.environ.get("MOVEIT_PLANNING_FRAME_ID", "world")
 GROUP_NAME = os.environ.get("MOVE_GROUP_NAME", "arm")
 TIP_LINK = os.environ.get("TIP_LINK", "link6")
 MOVE_ACTION = os.environ.get("MOVE_ACTION", "/move_action")
@@ -43,6 +44,8 @@ JOINT_COMMAND_TOPIC = os.environ.get("JOINT_COMMAND_TOPIC", "/joint_ctrl_cmd")
 ENABLE_COMMAND_TOPIC = os.environ.get("ENABLE_COMMAND_TOPIC", "/enable_cmd")
 ARM_STATUS_TOPIC = os.environ.get("ARM_STATUS_TOPIC", "/arm_status")
 END_POSE_TOPIC = os.environ.get("END_POSE_TOPIC", "/link6_pose")
+IK_SERVICE = os.environ.get("IK_SERVICE", "/compute_ik")
+PLAN_SERVICE = os.environ.get("PLAN_SERVICE", "/plan_kinematic_path")
 DEFAULT_SPEED_PERCENT = float(os.environ.get("PIPER_WEB_SPEED_PERCENT", "30.0"))
 GRIPPER_OPEN_METERS = float(os.environ.get("PIPER_GRIPPER_OPEN_METERS", "0.08"))
 GRIPPER_CLOSED_METERS = float(os.environ.get("PIPER_GRIPPER_CLOSED_METERS", "0.0"))
@@ -54,14 +57,22 @@ OMPL_DEFAULT = {
     "attempts": int(os.environ.get("PIPER_OMPL_ATTEMPTS", "1")),
     "ik_timeout": float(os.environ.get("PIPER_OMPL_IK_TIMEOUT", "0.6")),
 }
+GRASP_YAW_STEP_DEG = float(os.environ.get("PIPER_GRASP_YAW_STEP_DEG", "15"))
+GRASP_MAX_CANDIDATES = int(os.environ.get("PIPER_GRASP_MAX_CANDIDATES", "8"))
+GRASP_PLANNING_TIME = float(os.environ.get("PIPER_GRASP_PLANNING_TIME", "1.0"))
+GRASP_ATTEMPTS = int(os.environ.get("PIPER_GRASP_ATTEMPTS", "1"))
+GRASP_IK_TIMEOUT = float(os.environ.get("PIPER_GRASP_IK_TIMEOUT", "0.6"))
+ANGLED_GRASP_X_GROUND_ANGLE_DEG = float(os.environ.get("PIPER_ANGLED_GRASP_X_GROUND_ANGLE_DEG", "30"))
 
 try:
     import rclpy
+    from builtin_interfaces.msg import Duration
     from control_msgs.action import FollowJointTrajectory
     from geometry_msgs.msg import Pose, PoseStamped
     from moveit_msgs.action import MoveGroup
     from moveit_msgs.msg import (
         Constraints,
+        JointConstraint,
         MotionPlanRequest,
         OrientationConstraint,
         PlanningOptions,
@@ -69,6 +80,7 @@ try:
         PositionConstraint,
         RobotState,
     )
+    from moveit_msgs.srv import GetMotionPlan, GetPositionIK
     from rclpy.action import ActionClient
     from rclpy.node import Node
     from sensor_msgs.msg import JointState
@@ -166,6 +178,30 @@ def quat_from_rpy(roll, pitch, yaw):
     }
 
 
+def quat_normalize(q):
+    x = finite_float(q.get("x"), 0.0)
+    y = finite_float(q.get("y"), 0.0)
+    z = finite_float(q.get("z"), 0.0)
+    w = finite_float(q.get("w"), 1.0)
+    length = math.sqrt(x * x + y * y + z * z + w * w)
+    if length <= 1e-9:
+        return {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}
+    return {"x": x / length, "y": y / length, "z": z / length, "w": w / length}
+
+
+def quat_angle(a, b):
+    qa = quat_normalize(a)
+    qb = quat_normalize(b)
+    dot = (
+        qa["x"] * qb["x"]
+        + qa["y"] * qb["y"]
+        + qa["z"] * qb["z"]
+        + qa["w"] * qb["w"]
+    )
+    dot = max(-1.0, min(1.0, abs(dot)))
+    return 2.0 * math.acos(dot)
+
+
 def quat_to_rpy(q):
     x = finite_float(q.get("x"), 0.0)
     y = finite_float(q.get("y"), 0.0)
@@ -180,6 +216,151 @@ def quat_to_rpy(q):
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     yaw = math.atan2(siny_cosp, cosy_cosp)
     return roll, pitch, yaw
+
+
+def quat_from_matrix(matrix):
+    m00, m01, m02 = matrix[0]
+    m10, m11, m12 = matrix[1]
+    m20, m21, m22 = matrix[2]
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        return quat_normalize({
+            "w": 0.25 * scale,
+            "x": (m21 - m12) / scale,
+            "y": (m02 - m20) / scale,
+            "z": (m10 - m01) / scale,
+        })
+    if m00 > m11 and m00 > m22:
+        scale = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        return quat_normalize({
+            "w": (m21 - m12) / scale,
+            "x": 0.25 * scale,
+            "y": (m01 + m10) / scale,
+            "z": (m02 + m20) / scale,
+        })
+    if m11 > m22:
+        scale = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        return quat_normalize({
+            "w": (m02 - m20) / scale,
+            "x": (m01 + m10) / scale,
+            "y": 0.25 * scale,
+            "z": (m12 + m21) / scale,
+        })
+    scale = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+    return quat_normalize({
+        "w": (m10 - m01) / scale,
+        "x": (m02 + m20) / scale,
+        "y": (m12 + m21) / scale,
+        "z": 0.25 * scale,
+    })
+
+
+def normalize_angle(angle):
+    value = math.fmod(float(angle) + math.pi, 2.0 * math.pi)
+    if value < 0.0:
+        value += 2.0 * math.pi
+    return value - math.pi
+
+
+def dedupe_angles(angles, tolerance=1e-6):
+    result = []
+    for angle in angles:
+        normalized = normalize_angle(angle)
+        if all(abs(normalize_angle(normalized - existing)) > tolerance for existing in result):
+            result.append(normalized)
+    return result
+
+
+def rpy_to_matrix(roll, pitch, yaw):
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+
+
+def local_axis_world_z(roll, pitch, axis="y"):
+    matrix = rpy_to_matrix(roll, pitch, 0.0)
+    axis_index = {"x": 0, "y": 1, "z": 2}.get(axis, 1)
+    return matrix[2][axis_index]
+
+
+def side_grasp_constraint_error(roll, pitch):
+    return abs(abs(local_axis_world_z(roll, pitch, "y")) - 1.0)
+
+
+def vertical_grasp_constraint_error(roll, pitch):
+    return abs(abs(local_axis_world_z(roll, pitch, "x")) - 1.0)
+
+
+def vec_dot(a, b):
+    return sum(float(x) * float(y) for x, y in zip(a, b))
+
+
+def vec_cross(a, b):
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+
+
+def vec_scale(vector, scalar):
+    return [float(value) * float(scalar) for value in vector]
+
+
+def vec_normalize(vector, label="vector"):
+    length = math.sqrt(sum(float(value) * float(value) for value in vector))
+    if length <= 1e-9:
+        raise ValueError(f"{label} length is zero")
+    return [float(value) / length for value in vector]
+
+
+def boolish(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def moveit_error_message(code):
+    messages = {
+        1: "SUCCESS",
+        99999: "FAILURE",
+        -1: "PLANNING_FAILED",
+        -2: "INVALID_MOTION_PLAN",
+        -3: "MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE",
+        -4: "CONTROL_FAILED",
+        -5: "UNABLE_TO_AQUIRE_SENSOR_DATA",
+        -6: "TIMED_OUT",
+        -7: "PREEMPTED",
+        -10: "START_STATE_IN_COLLISION",
+        -11: "START_STATE_VIOLATES_PATH_CONSTRAINTS",
+        -12: "GOAL_IN_COLLISION",
+        -13: "GOAL_VIOLATES_PATH_CONSTRAINTS",
+        -14: "GOAL_CONSTRAINTS_VIOLATED",
+        -15: "INVALID_GROUP_NAME",
+        -16: "INVALID_GOAL_CONSTRAINTS",
+        -17: "INVALID_ROBOT_STATE",
+        -18: "INVALID_LINK_NAME",
+        -19: "INVALID_OBJECT_NAME",
+        -21: "FRAME_TRANSFORM_FAILURE",
+        -22: "COLLISION_CHECKING_UNAVAILABLE",
+        -23: "ROBOT_STATE_STALE",
+        -24: "SENSOR_INFO_STALE",
+        -25: "COMMUNICATION_FAILURE",
+        -26: "NO_IK_SOLUTION",
+        -27: "INVALID_LINK_NAME",
+        -31: "INVALID_TRAJECTORY",
+    }
+    return messages.get(int(code), f"UNKNOWN({code})")
 
 
 def load_joint_limits():
@@ -230,6 +411,7 @@ class PiperWebBridge(Node if rclpy is not None else object):
         self._last_trajectory_arm = "right"
         self._status = {"right": "ready", "left": "piper 单臂模式"}
         self._topics = []
+        self._planning_lock = threading.Lock()
 
         self.create_subscription(JointState, JOINT_FEEDBACK_TOPIC, lambda msg: self._on_joint_state(msg, JOINT_FEEDBACK_TOPIC), 10)
         self.create_subscription(JointState, JOINT_STATE_TOPIC, lambda msg: self._on_joint_state(msg, JOINT_STATE_TOPIC), 10)
@@ -241,6 +423,8 @@ class PiperWebBridge(Node if rclpy is not None else object):
         self._enable_pub = self.create_publisher(Bool, ENABLE_COMMAND_TOPIC, 10)
         self._move_client = ActionClient(self, MoveGroup, MOVE_ACTION)
         self._trajectory_client = ActionClient(self, FollowJointTrajectory, TRAJECTORY_ACTION)
+        self._ik_client = self.create_client(GetPositionIK, IK_SERVICE)
+        self._plan_client = self.create_client(GetMotionPlan, PLAN_SERVICE)
         self.create_timer(1.0, self._refresh_topics)
 
     def _refresh_topics(self):
@@ -459,7 +643,10 @@ class PiperWebBridge(Node if rclpy is not None else object):
             opening = clamp(finite_float(body.get("opening_m"), opening), 0.0, 0.08)
         positions = self._current_positions()
         positions[6] = opening
-        self._publish_joint_command(positions, effort=finite_float(body.get("effort"), 1.0))
+        effort = finite_float(body.get("effort"), 1.0)
+        for _index in range(3):
+            self._publish_joint_command(positions, effort=effort)
+            time.sleep(0.04)
         with self._lock:
             self._status["right"] = f"gripper {action}"
         return {"ok": True, "arm": "right", "state": "open" if opening > 0.02 else "closed", "opening_m": opening}
@@ -475,10 +662,9 @@ class PiperWebBridge(Node if rclpy is not None else object):
             time.sleep(0.01)
         return future.done()
 
-    def _make_pose_stamped(self, body):
+    def _make_pose_stamped(self, body, frame_id=None):
         pose = PoseStamped()
-        pose.header.frame_id = FRAME_ID
-        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.header.frame_id = frame_id or FRAME_ID
         pose.pose.position.x = finite_float(body.get("x"), 0.3)
         pose.pose.position.y = finite_float(body.get("y"), 0.0)
         pose.pose.position.z = finite_float(body.get("z"), 0.35)
@@ -519,12 +705,12 @@ class PiperWebBridge(Node if rclpy is not None else object):
         position_constraint.constraint_region.primitive_poses.append(region_pose)
         constraints.position_constraints.append(position_constraint)
 
-        if not bool(body.get("position_only", True)):
+        if not boolish(body.get("position_only"), True):
             orientation_constraint = OrientationConstraint()
             orientation_constraint.header = target.header
             orientation_constraint.link_name = TIP_LINK
             orientation_constraint.orientation = target.pose.orientation
-            tolerance = max(0.01, finite_float(body.get("orientation_tolerance"), 0.5))
+            tolerance = max(0.005, finite_float(body.get("orientation_tolerance"), 0.12))
             orientation_constraint.absolute_x_axis_tolerance = tolerance
             orientation_constraint.absolute_y_axis_tolerance = tolerance
             orientation_constraint.absolute_z_axis_tolerance = tolerance
@@ -547,7 +733,418 @@ class PiperWebBridge(Node if rclpy is not None else object):
         state.is_diff = True
         return state
 
+    @staticmethod
+    def _duration_msg(seconds):
+        seconds = max(0.0, float(seconds))
+        whole = int(seconds)
+        return Duration(sec=whole, nanosec=int((seconds - whole) * 1_000_000_000))
+
+    @staticmethod
+    def _trajectory_duration(trajectory):
+        if not trajectory or not trajectory.points:
+            return 0.0
+        return duration_to_sec(trajectory.points[-1].time_from_start)
+
+    def _ompl_runtime_config(self, body):
+        planner_id = str(body.get("planner_id") or body.get("planner") or OMPL_DEFAULT["planner_id"])
+        if planner_id == "default":
+            planner_id = ""
+        return {
+            "planner_id": planner_id,
+            "planning_time": max(0.1, finite_float(body.get("planning_time"), OMPL_DEFAULT["planning_time"])),
+            "attempts": max(1, int(finite_float(body.get("attempts"), OMPL_DEFAULT["attempts"]))),
+            "ik_timeout": max(0.1, finite_float(body.get("ik_timeout"), OMPL_DEFAULT["ik_timeout"])),
+        }
+
+    def _horizontal_grasp_preferred_yaw(self, pose):
+        x = finite_float(pose.get("x"), 0.0)
+        y = finite_float(pose.get("y"), 0.0)
+        if abs(x) > 1e-6 or abs(y) > 1e-6:
+            return math.atan2(y, x)
+        return finite_float(pose.get("yaw"), 0.0)
+
+    def _scan_yaws(self, preferred):
+        step = math.radians(max(1.0, min(90.0, GRASP_YAW_STEP_DEG)))
+        offsets = [0.0]
+        rings = int(math.ceil(math.pi / step))
+        for index in range(1, rings + 1):
+            offsets.extend([index * step, -index * step])
+        return dedupe_angles([preferred + offset for offset in offsets])
+
+    def _horizontal_grasp_pose_candidates(self, pose):
+        base_pose = dict(pose)
+        preferred = self._horizontal_grasp_preferred_yaw(base_pose)
+        rpy_pairs = [
+            (math.pi / 2.0, 0.0),
+            (-math.pi / 2.0, 0.0),
+            (math.pi / 2.0, math.pi),
+            (-math.pi / 2.0, math.pi),
+        ]
+        candidates = []
+        for yaw in self._scan_yaws(preferred):
+            for roll, pitch in rpy_pairs:
+                if side_grasp_constraint_error(roll, pitch) > 1e-6:
+                    continue
+                candidate = dict(base_pose)
+                candidate.update({
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "position_only": False,
+                })
+                candidate.pop("orientation", None)
+                candidate["_horizontal_grasp"] = {
+                    "constraint": "tool_y_perpendicular_to_world_xy",
+                    "tool_axis": "tool_y",
+                    "ground_normal": [0.0, 0.0, 1.0],
+                    "dot": local_axis_world_z(roll, pitch, "y"),
+                    "preferred_yaw": preferred,
+                }
+                candidates.append(candidate)
+                if len(candidates) >= GRASP_MAX_CANDIDATES:
+                    return candidates
+        return candidates
+
+    def _vertical_grasp_pose_candidates(self, pose):
+        base_pose = dict(pose)
+        preferred = self._horizontal_grasp_preferred_yaw(base_pose)
+        rpy_pairs = [
+            (0.0, -math.pi / 2.0),
+            (math.pi, -math.pi / 2.0),
+            (0.0, math.pi / 2.0),
+            (math.pi, math.pi / 2.0),
+        ]
+        candidates = []
+        for yaw in self._scan_yaws(preferred):
+            for roll, pitch in rpy_pairs:
+                if vertical_grasp_constraint_error(roll, pitch) > 1e-6:
+                    continue
+                candidate = dict(base_pose)
+                candidate.update({
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "position_only": False,
+                })
+                candidate.pop("orientation", None)
+                candidate["_vertical_grasp"] = {
+                    "constraint": "tool_x_perpendicular_to_world_xy",
+                    "tool_axis": "tool_x",
+                    "ground_normal": [0.0, 0.0, 1.0],
+                    "dot": local_axis_world_z(roll, pitch, "x"),
+                    "preferred_yaw": preferred,
+                }
+                candidates.append(candidate)
+                if len(candidates) >= GRASP_MAX_CANDIDATES:
+                    return candidates
+        return candidates
+
+    def _angled_grasp_pose_candidates(self, pose):
+        base_pose = dict(pose)
+        preferred = self._horizontal_grasp_preferred_yaw(base_pose)
+        angle = math.radians(max(0.0, min(89.0, ANGLED_GRASP_X_GROUND_ANGLE_DEG)))
+        horizontal = math.cos(angle)
+        down = -math.sin(angle)
+        ground_normal = [0.0, 0.0, 1.0]
+        candidates = []
+        for yaw in self._scan_yaws(preferred):
+            heading = [math.cos(yaw), math.sin(yaw), 0.0]
+            x_axis = vec_normalize([
+                horizontal * heading[0],
+                horizontal * heading[1],
+                down,
+            ], "angled_grasp_tool_x")
+            z_base = vec_normalize([-math.sin(yaw), math.cos(yaw), 0.0], "angled_grasp_tool_z")
+            for z_sign in (1.0, -1.0):
+                z_axis = vec_scale(z_base, z_sign)
+                y_axis = vec_normalize(vec_cross(z_axis, x_axis), "angled_grasp_tool_y")
+                z_axis = vec_normalize(vec_cross(x_axis, y_axis), "angled_grasp_tool_z")
+                rotation = [
+                    [x_axis[0], y_axis[0], z_axis[0]],
+                    [x_axis[1], y_axis[1], z_axis[1]],
+                    [x_axis[2], y_axis[2], z_axis[2]],
+                ]
+                orientation = quat_from_matrix(rotation)
+                roll, pitch, rpy_yaw = quat_to_rpy(orientation)
+                x_ground_dot = vec_dot(x_axis, ground_normal)
+                z_ground_dot = vec_dot(z_axis, ground_normal)
+                candidate = dict(base_pose)
+                candidate.update({
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": rpy_yaw,
+                    "orientation": orientation,
+                    "position_only": False,
+                })
+                candidate["_angled_grasp"] = {
+                    "constraint": "tool_z_parallel_to_world_xy_and_tool_x_30deg_to_ground",
+                    "tool_z_axis": "tool_z",
+                    "tool_x_axis": "tool_x",
+                    "ground_normal": ground_normal,
+                    "tool_x": x_axis,
+                    "tool_y": y_axis,
+                    "tool_z": z_axis,
+                    "tool_x_ground_dot": x_ground_dot,
+                    "tool_z_ground_dot": z_ground_dot,
+                    "tool_x_ground_angle_deg": round(math.degrees(math.asin(min(1.0, abs(x_ground_dot)))), 6),
+                    "tool_x_ground_angle_target_deg": ANGLED_GRASP_X_GROUND_ANGLE_DEG,
+                    "tool_x_vertical_preference": "down",
+                    "z_sign": z_sign,
+                    "preferred_yaw": preferred,
+                    "scan_yaw": yaw,
+                }
+                candidates.append(candidate)
+                if len(candidates) >= GRASP_MAX_CANDIDATES:
+                    return candidates
+        return candidates
+
+    def _make_joint_goal_constraints(self, target_joint_state, tolerance=0.01):
+        target_by_name = dict(zip(target_joint_state.name, target_joint_state.position))
+        missing = [name for name in JOINT_NAMES if name not in target_by_name]
+        if missing:
+            raise RuntimeError(f"IK 结果缺少关节: {missing}")
+        constraints = Constraints()
+        for name in JOINT_NAMES:
+            joint = JointConstraint()
+            joint.joint_name = name
+            joint.position = float(target_by_name[name])
+            joint.tolerance_above = float(tolerance)
+            joint.tolerance_below = float(tolerance)
+            joint.weight = 1.0
+            constraints.joint_constraints.append(joint)
+        return constraints
+
+    def _compute_ik_for_pose(self, pose, timeout_sec=0.6, avoid_collisions=False):
+        request = GetPositionIK.Request()
+        request.ik_request.group_name = GROUP_NAME
+        request.ik_request.ik_link_name = TIP_LINK
+        request.ik_request.pose_stamped = self._make_pose_stamped(pose, MOVEIT_PLANNING_FRAME_ID)
+        request.ik_request.robot_state = self._make_start_state()
+        request.ik_request.avoid_collisions = bool(avoid_collisions)
+        timeout_sec = max(0.1, float(timeout_sec))
+        request.ik_request.timeout = self._duration_msg(timeout_sec)
+
+        started = time.monotonic()
+        future = self._ik_client.call_async(request)
+        if not self._wait_future(future, timeout_sec + 1.0):
+            elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
+            return None, {"ok": False, "error_code": -6, "reason": "IK_TIMEOUT", "elapsed_ms": elapsed_ms}
+        result = future.result()
+        code = int(result.error_code.val)
+        return result, {
+            "ok": code == 1,
+            "error_code": code,
+            "reason": moveit_error_message(code),
+            "elapsed_ms": round((time.monotonic() - started) * 1000.0, 1),
+        }
+
+    def _moveit_plan_to_joint_state(self, target_joint_state, pose, ompl_config, started, mode="IK + joint MoveIt plan"):
+        request = GetMotionPlan.Request()
+        motion_request = MotionPlanRequest()
+        motion_request.group_name = GROUP_NAME
+        motion_request.pipeline_id = "ompl"
+        motion_request.planner_id = ompl_config["planner_id"]
+        motion_request.num_planning_attempts = ompl_config["attempts"]
+        motion_request.allowed_planning_time = ompl_config["planning_time"]
+        motion_request.max_velocity_scaling_factor = clamp(finite_float(pose.get("velocity_scaling"), 0.05), 0.01, 1.0)
+        motion_request.max_acceleration_scaling_factor = clamp(finite_float(pose.get("acceleration_scaling"), 0.05), 0.01, 1.0)
+        motion_request.start_state = self._make_start_state()
+        goal_tolerance = max(0.001, finite_float(pose.get("joint_goal_tolerance"), 0.01))
+        motion_request.goal_constraints.append(self._make_joint_goal_constraints(target_joint_state, goal_tolerance))
+        request.motion_plan_request = motion_request
+
+        future = self._plan_client.call_async(request)
+        timeout = motion_request.allowed_planning_time + 3.0
+        if not self._wait_future(future, timeout):
+            with self._lock:
+                self._status["right"] = "plan timeout"
+            raise RuntimeError("规划服务超时")
+        result = future.result()
+        code = int(result.motion_plan_response.error_code.val)
+        if code != 1:
+            reason = moveit_error_message(code)
+            with self._lock:
+                self._status["right"] = f"plan failed: {code}"
+            raise RuntimeError(f"MoveIt 规划失败，错误码={code}（{reason}）")
+
+        trajectory = result.motion_plan_response.trajectory.joint_trajectory
+        points = len(trajectory.points)
+        if points <= 0:
+            raise RuntimeError("MoveIt returned an empty trajectory")
+
+        target = self._make_pose_stamped(pose)
+        position_tolerance = max(0.001, finite_float(pose.get("position_tolerance"), 0.006))
+        orientation_tolerance = max(0.005, finite_float(pose.get("orientation_tolerance"), 0.12))
+        position_only = boolish(pose.get("position_only"), False)
+        target_orientation = {
+            "x": target.pose.orientation.x,
+            "y": target.pose.orientation.y,
+            "z": target.pose.orientation.z,
+            "w": target.pose.orientation.w,
+        }
+        summary = {
+            "ok": True,
+            "mode": mode,
+            "group": GROUP_NAME,
+            "tip": TIP_LINK,
+            "points": points,
+            "duration": self._trajectory_duration(trajectory),
+            "elapsed_ms": round((time.monotonic() - started) * 1000.0, 1),
+            "target": {
+                "x": target.pose.position.x,
+                "y": target.pose.position.y,
+                "z": target.pose.position.z,
+            },
+            "target_orientation": target_orientation,
+            "constraints": {
+                "position_only": position_only,
+                "position_tolerance": position_tolerance,
+                "orientation_constrained": not position_only,
+                "orientation_tolerance": orientation_tolerance,
+            },
+            "ompl": {
+                "planner_id": motion_request.planner_id or "default",
+                "planning_time": motion_request.allowed_planning_time,
+                "attempts": motion_request.num_planning_attempts,
+                "ik_timeout": ompl_config["ik_timeout"],
+            },
+            "grasp_orientation": {
+                "mode": pose.get("grasp_orientation_mode", "custom_grasp"),
+                "candidate_index": 1,
+                "roll": finite_float(pose.get("roll"), 0.0),
+                "pitch": finite_float(pose.get("pitch"), 0.0),
+                "yaw": finite_float(pose.get("yaw"), 0.0),
+                "constrained": not position_only,
+                "tolerance": orientation_tolerance,
+            },
+        }
+        with self._lock:
+            self._last_trajectory = copy.deepcopy(trajectory)
+            self._last_trajectory_arm = "right"
+            self._last_plan["right"] = summary
+            self._status["right"] = "planned"
+        log_event("INFO", "Piper IK + joint plan ready", summary)
+        return summary
+
+    def _plan_single_pose(self, body):
+        if not self._ik_client.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError(f"IK service not ready: {IK_SERVICE}")
+        if not self._plan_client.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError(f"planning service not ready: {PLAN_SERVICE}")
+        pose = dict(body or {})
+        pose.setdefault("position_only", False)
+        ompl_config = self._ompl_runtime_config(pose)
+        avoid_collisions = boolish(pose.get("avoid_collisions"), boolish(pose.get("avoid_platform"), False))
+        with self._lock:
+            self._status["right"] = "planning"
+        started = time.monotonic()
+        ik_result, ik_status = self._compute_ik_for_pose(
+            pose,
+            timeout_sec=ompl_config["ik_timeout"],
+            avoid_collisions=avoid_collisions,
+        )
+        if not ik_status["ok"]:
+            with self._lock:
+                self._status["right"] = f"ik failed: {ik_status.get('error_code')}"
+            raise RuntimeError(
+                f"IK 逆解失败，MoveIt 错误码={ik_status.get('error_code')}（{ik_status.get('reason')}）"
+            )
+        summary = self._moveit_plan_to_joint_state(
+            ik_result.solution.joint_state,
+            pose,
+            ompl_config,
+            started,
+        )
+        summary["ik"] = ik_status
+        with self._lock:
+            self._last_plan["right"] = summary
+        return summary
+
+    def _plan_grasp_candidates(self, body, mode, candidates, meta_key, result_mode, failure_label):
+        errors = []
+        if not candidates:
+            raise RuntimeError(f"{failure_label}未生成候选姿态")
+        for index, candidate in enumerate(candidates, start=1):
+            candidate.setdefault("planning_time", GRASP_PLANNING_TIME)
+            candidate.setdefault("attempts", GRASP_ATTEMPTS)
+            candidate.setdefault("ik_timeout", GRASP_IK_TIMEOUT)
+            candidate.setdefault("orientation_tolerance", finite_float(body.get("orientation_tolerance"), 0.12))
+            candidate.setdefault("position_tolerance", finite_float(body.get("position_tolerance"), 0.012))
+            candidate["position_only"] = False
+            try:
+                summary = self._plan_single_pose(candidate)
+                grasp_orientation = {
+                    "mode": result_mode,
+                    "candidate_index": index,
+                    "candidate_count": len(candidates),
+                    "roll": candidate["roll"],
+                    "pitch": candidate["pitch"],
+                    "yaw": candidate["yaw"],
+                    "constrained": True,
+                    "tolerance": max(0.005, finite_float(candidate.get("orientation_tolerance"), 0.12)),
+                    **candidate.get(meta_key, {}),
+                }
+                summary["grasp_orientation"] = grasp_orientation
+                summary["constraints"]["position_only"] = False
+                summary["constraints"]["orientation_constrained"] = True
+                with self._lock:
+                    self._last_plan["right"] = summary
+                log_event("INFO", f"Piper {mode} orientation selected", grasp_orientation)
+                return {"ok": True, "plan": summary}
+            except Exception as exc:
+                error = str(exc)
+                errors.append(error)
+                log_event("DEBUG", f"Piper {mode} candidate failed", {
+                    "candidate_index": index,
+                    "roll": candidate.get("roll"),
+                    "pitch": candidate.get("pitch"),
+                    "yaw": candidate.get("yaw"),
+                    "error": error,
+                })
+        detail = "; ".join(errors[-3:]) if errors else "无候选姿态"
+        raise RuntimeError(f"{failure_label}未找到可行 IK/规划: {detail}")
+
     def plan_pose(self, body):
+        if not self._planning_lock.acquire(blocking=False):
+            raise RuntimeError("已有规划正在运行，请等待当前规划结束")
+        try:
+            pose = dict(body or {})
+            mode = pose.get("grasp_orientation_mode")
+            if mode in ("side_grasp", "horizontal_cylinder"):
+                return self._plan_grasp_candidates(
+                    pose,
+                    "side grasp",
+                    self._horizontal_grasp_pose_candidates(pose),
+                    "_horizontal_grasp",
+                    "side_grasp",
+                    "侧面抓取姿态",
+                )
+            if mode == "vertical_grasp":
+                return self._plan_grasp_candidates(
+                    pose,
+                    "vertical grasp",
+                    self._vertical_grasp_pose_candidates(pose),
+                    "_vertical_grasp",
+                    "vertical_grasp",
+                    "垂直抓取姿态",
+                )
+            if mode in ("angled_grasp", "z_parallel_grasp"):
+                return self._plan_grasp_candidates(
+                    pose,
+                    "angled grasp",
+                    self._angled_grasp_pose_candidates(pose),
+                    "_angled_grasp",
+                    "angled_grasp",
+                    "斜向抓取姿态",
+                )
+            if boolish(pose.get("position_only"), True):
+                return self._plan_pose_move_group(pose)
+            summary = self._plan_single_pose(pose)
+            return {"ok": True, "plan": summary}
+        finally:
+            self._planning_lock.release()
+
+    def _plan_pose_move_group(self, body):
         if not self._move_client.wait_for_server(timeout_sec=2.0):
             raise RuntimeError(f"MoveGroup action not ready: {MOVE_ACTION}")
 
@@ -604,6 +1201,15 @@ class PiperWebBridge(Node if rclpy is not None else object):
         if points <= 0:
             raise RuntimeError("MoveIt returned an empty trajectory")
         duration = duration_to_sec(trajectory.points[-1].time_from_start)
+        position_tolerance = max(0.001, finite_float(body.get("position_tolerance"), 0.005))
+        orientation_tolerance = max(0.005, finite_float(body.get("orientation_tolerance"), 0.12))
+        position_only = boolish(body.get("position_only"), True)
+        target_orientation = {
+            "x": target.pose.orientation.x,
+            "y": target.pose.orientation.y,
+            "z": target.pose.orientation.z,
+            "w": target.pose.orientation.w,
+        }
         summary = {
             "ok": True,
             "mode": "MoveIt plan-only",
@@ -617,6 +1223,13 @@ class PiperWebBridge(Node if rclpy is not None else object):
                 "y": target.pose.position.y,
                 "z": target.pose.position.z,
             },
+            "target_orientation": target_orientation,
+            "constraints": {
+                "position_only": position_only,
+                "position_tolerance": position_tolerance,
+                "orientation_constrained": not position_only,
+                "orientation_tolerance": orientation_tolerance,
+            },
             "ompl": {
                 "planner_id": request.planner_id or "default",
                 "planning_time": request.allowed_planning_time,
@@ -628,6 +1241,8 @@ class PiperWebBridge(Node if rclpy is not None else object):
                 "roll": finite_float(body.get("roll"), 0.0),
                 "pitch": finite_float(body.get("pitch"), 0.0),
                 "yaw": finite_float(body.get("yaw"), 0.0),
+                "constrained": not position_only,
+                "tolerance": orientation_tolerance,
             },
         }
         with self._lock:
@@ -660,10 +1275,85 @@ class PiperWebBridge(Node if rclpy is not None else object):
             raise RuntimeError("trajectory execution timeout")
         result = result_future.result().result
         error_code = int(getattr(result, "error_code", 0))
+        validation = None
+        if error_code == 0 and plan and not plan.get("constraints", {}).get("position_only", True):
+            validation = self._wait_for_pose_constraint(plan)
+            if not validation.get("ok"):
+                message = (
+                    f"姿态约束未满足: "
+                    f"orientation_error={math.degrees(validation.get('orientation_error_rad', 0.0)):.1f}deg "
+                    f"> tolerance={math.degrees(validation.get('orientation_tolerance_rad', 0.0)):.1f}deg"
+                )
+                with self._lock:
+                    self._status["right"] = "constraint error"
+                log_event("ERROR", "Piper pose constraint validation failed", validation)
+                return {
+                    "ok": False,
+                    "error": message,
+                    "error_code": error_code,
+                    "plan": plan,
+                    "constraint": validation,
+                }
         with self._lock:
             self._status["right"] = "executed" if error_code == 0 else f"execute error {error_code}"
-        log_event("INFO", "Piper trajectory executed", {"error_code": error_code})
-        return {"ok": error_code == 0, "error_code": error_code, "plan": plan}
+        log_event("INFO", "Piper trajectory executed", {"error_code": error_code, "constraint": validation})
+        return {"ok": error_code == 0, "error_code": error_code, "plan": plan, "constraint": validation}
+
+    def _wait_for_pose_constraint(self, plan, timeout_sec=2.0):
+        deadline = time.monotonic() + timeout_sec
+        last = None
+        while time.monotonic() < deadline:
+            last = self._pose_constraint_error(plan)
+            if last.get("ok"):
+                return last
+            time.sleep(0.05)
+        return last or {"ok": False, "error": f"waiting for {END_POSE_TOPIC}"}
+
+    def _pose_constraint_error(self, plan):
+        with self._lock:
+            link_pose = copy.deepcopy(self._link_pose)
+        if not link_pose or not link_pose.get("ok"):
+            return {"ok": False, "error": f"waiting for {END_POSE_TOPIC}"}
+
+        constraints = plan.get("constraints", {})
+        target_position = plan.get("target", {})
+        target_orientation = plan.get("target_orientation", {})
+        current_position = link_pose.get("position", [None, None, None])
+        current_orientation = {
+            "x": link_pose.get("orientation", [0.0, 0.0, 0.0, 1.0])[0],
+            "y": link_pose.get("orientation", [0.0, 0.0, 0.0, 1.0])[1],
+            "z": link_pose.get("orientation", [0.0, 0.0, 0.0, 1.0])[2],
+            "w": link_pose.get("orientation", [0.0, 0.0, 0.0, 1.0])[3],
+        }
+        target_xyz = [
+            finite_float(target_position.get("x"), 0.0),
+            finite_float(target_position.get("y"), 0.0),
+            finite_float(target_position.get("z"), 0.0),
+        ]
+        position_error = math.sqrt(sum(
+            (finite_float(current_position[index], 0.0) - target_xyz[index]) ** 2
+            for index in range(3)
+        ))
+        orientation_error = quat_angle(target_orientation, current_orientation)
+        position_tolerance = max(0.001, finite_float(constraints.get("position_tolerance"), 0.005))
+        orientation_tolerance = max(0.005, finite_float(constraints.get("orientation_tolerance"), 0.12))
+        return {
+            "ok": position_error <= position_tolerance and orientation_error <= orientation_tolerance,
+            "position_error_m": position_error,
+            "position_tolerance_m": position_tolerance,
+            "orientation_error_rad": orientation_error,
+            "orientation_tolerance_rad": orientation_tolerance,
+            "source": END_POSE_TOPIC,
+            "target": {
+                "position": target_xyz,
+                "orientation": quat_normalize(target_orientation),
+            },
+            "actual": {
+                "position": current_position,
+                "orientation": quat_normalize(current_orientation),
+                "pose": link_pose.get("pose"),
+            },
+        }
 
     def _pose_from_body(self, body):
         pose = body.get("pose") if isinstance(body.get("pose"), dict) else body
@@ -677,7 +1367,7 @@ class PiperWebBridge(Node if rclpy is not None else object):
         result.setdefault("planning_time", finite_float(body.get("planning_time"), OMPL_DEFAULT["planning_time"]))
         result.setdefault("attempts", int(finite_float(body.get("attempts"), OMPL_DEFAULT["attempts"])))
         result.setdefault("planner_id", body.get("planner_id", OMPL_DEFAULT["planner_id"]))
-        result.setdefault("orientation_tolerance", finite_float(body.get("orientation_tolerance"), 0.35))
+        result.setdefault("orientation_tolerance", finite_float(body.get("orientation_tolerance"), 0.12))
         result.setdefault("position_tolerance", finite_float(body.get("position_tolerance"), 0.006))
         result.setdefault("position_only", False)
         result.setdefault("grasp_orientation_mode", body.get("grasp_orientation_mode", "custom_grasp"))

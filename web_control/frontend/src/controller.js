@@ -669,7 +669,8 @@ function readPose() {
     arm: state.arm,
     velocity_scaling: Number(byId('velocityScaling').value),
     acceleration_scaling: Number(byId('accelerationScaling').value),
-    orientation_tolerance: lockOrientation ? 0.28 : 0.5,
+    orientation_tolerance: lockOrientation ? 0.12 : 0.5,
+    position_tolerance: lockOrientation ? 0.012 : 0.006,
     stay_near: false,
     avoid_platform: byId('avoidPlatform').checked,
     collision_boxes: currentManualCollisionBoxes(),
@@ -681,7 +682,12 @@ function readPose() {
 }
 
 function readGraspPose() {
-  return readPose();
+  return {
+    ...readPose(),
+    position_only: false,
+    orientation_tolerance: 0.12,
+    position_tolerance: 0.012
+  };
 }
 
 function numericValue(id, fallback) {
@@ -1154,8 +1160,8 @@ async function runArmAction(action) {
     confirm: `${command[0]}将驱动${armLabel()}，确认周围无人员或障碍物。`
   });
   updateManualCollisionFromSummary(findManualCollisionSummary(result));
-  refreshGripper();
-  refreshStatus();
+  await refreshGripper();
+  await refreshStatus();
 }
 
 async function runAutoPick() {
@@ -1173,7 +1179,7 @@ async function runAutoPick() {
     { confirm: `即将由${armLabel()}执行完整夹取流程，请确认目标位姿和现场安全。`, confirmTitle: '确认自动夹取' }
   );
   updateManualCollisionFromSummary(findManualCollisionSummary(result));
-  refreshGripper();
+  await refreshGripper();
 }
 
 async function enableRobot() {
