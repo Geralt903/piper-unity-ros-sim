@@ -84,6 +84,11 @@ require_ros2() {
   fi
 }
 
+is_process_running() {
+  local pattern="$1"
+  pgrep -f "${pattern}" >/dev/null 2>&1
+}
+
 publish_enable() {
   local value="$1"
   ros2 topic pub --once /enable_cmd std_msgs/msg/Bool "{data: ${value}}"
@@ -134,17 +139,27 @@ start_moveit_headless() {
   _start_moveit_common move_group.launch.py "MoveIt move_group（无 RViz）"
 }
 
+start_moveit_headless_default() {
+  local package="${PIPER_MOVEIT_PACKAGE:-piper_with_gripper_moveit}"
+  _start_moveit_common move_group.launch.py "MoveIt move_group（无 RViz）" "${package}"
+}
+
 _start_moveit_common() {
   local launch_file="$1"
   local label="$2"
-  local package="piper_with_gripper_moveit"
+  local package="${3:-}"
   local log_file="/tmp/piper_moveit_$(date +%Y%m%d_%H%M%S).log"
-  read -r -p "启动有夹爪 MoveIt? [Y/n] " answer
-  if [[ "${answer,,}" == "n" ]]; then
-    package="piper_no_gripper_moveit"
+  local answer
+
+  if [[ -z "${package}" ]]; then
+    package="piper_with_gripper_moveit"
+    read -r -p "启动有夹爪 MoveIt? [Y/n] " answer
+    if [[ "${answer,,}" == "n" ]]; then
+      package="piper_no_gripper_moveit"
+    fi
   fi
 
-  if ! pgrep -f piper_moveit_to_unity_bridge >/dev/null 2>&1; then
+  if ! is_process_running piper_moveit_to_unity_bridge; then
     start_moveit_to_unity_bridge
     sleep 1
   fi
@@ -303,6 +318,51 @@ start_fk_publisher() {
   echo "发布 /link6_pose 话题 (base_link → link6 正运动学)。"
 }
 
+start_ros_tcp_endpoint_if_needed() {
+  if is_process_running default_server_endpoint; then
+    echo "ROS TCP Endpoint 已在运行。"
+    return 0
+  fi
+
+  start_ros_tcp_endpoint
+}
+
+start_moveit_to_unity_bridge_if_needed() {
+  if is_process_running piper_moveit_to_unity_bridge.py; then
+    echo "MoveIt -> Unity action bridge 已在运行。"
+    return 0
+  fi
+
+  start_moveit_to_unity_bridge
+}
+
+start_fk_publisher_if_needed() {
+  if is_process_running piper_fk_publisher.py; then
+    echo "FK 坐标发布器已在运行。"
+    return 0
+  fi
+
+  start_fk_publisher
+}
+
+start_moveit_headless_if_needed() {
+  if is_process_running 'move_group.launch.py|piper_moveit.launch.py'; then
+    echo "MoveIt 已在运行。"
+    return 0
+  fi
+
+  start_moveit_headless_default
+}
+
+start_web_pose_server_if_needed() {
+  if is_process_running "${SURF_ROOT}/web_control/web_control/server.py"; then
+    echo "Piper Web 控制台已在运行。"
+    return 0
+  fi
+
+  start_web_pose_server
+}
+
 run_pose_planner_interactive() {
   local x y z roll pitch yaw planner
 
@@ -456,6 +516,30 @@ quick_start() {
   start_fk_publisher
 }
 
+start_unity_simulation_chain() {
+  echo "一键启动 Unity 仿真链路：Endpoint + action bridge + FK + MoveIt headless + Web。"
+  echo "Endpoint 启动后请让 Unity 进入 Play；如果 Unity 已连接失败，停止后重新 Play。"
+  echo "MoveIt 默认使用 ${PIPER_MOVEIT_PACKAGE:-piper_with_gripper_moveit}；需要无夹爪可先设置 PIPER_MOVEIT_PACKAGE=piper_no_gripper_moveit。"
+
+  if ! start_ros_tcp_endpoint_if_needed; then
+    echo "ROS TCP Endpoint 启动失败，仿真链路未继续启动。"
+    return 0
+  fi
+  sleep 1
+
+  start_moveit_to_unity_bridge_if_needed
+  sleep 1
+
+  start_fk_publisher_if_needed
+  sleep 1
+
+  start_moveit_headless_if_needed
+  sleep 1
+
+  start_web_pose_server_if_needed
+  echo "仿真链路已启动。打开 Web 控制台，等状态变绿后再发送位姿。"
+}
+
 menu_loop() {
   require_ros2
   echo "Piper Unity Simulation ROS TCP 菜单"
@@ -464,7 +548,7 @@ menu_loop() {
 
   while true; do
     echo
-    echo "常用顺序：1 -> Unity Play -> 2 或 3"
+    echo "常用顺序：9 -> Unity Play -> Web；手动调试可用 1 -> Unity Play -> 2 或 3"
     echo
     echo "  1) 快速启动基础链路"
     echo "  2) 启动 MoveIt RViz"
@@ -474,6 +558,7 @@ menu_loop() {
     echo "  6) 检查/调试"
     echo "  7) 服务/高级启动"
     echo "  8) 启动真机平滑桥"
+    echo "  9) 一键启动 Unity 仿真链路"
     echo "  q) 退出"
     read -r -p "> " choice
 
@@ -486,6 +571,7 @@ menu_loop() {
       6) debug_menu ;;
       7) service_menu ;;
       8) start_real_arm_smooth_bridge ;;
+      9) start_unity_simulation_chain ;;
       q|Q|quit|exit) break ;;
       *) echo "未知选项" ;;
     esac
