@@ -23,16 +23,22 @@ EOF
 }
 
 source_ros() {
+  local rc=0
+  set +e
   set +u
   if [[ -f /opt/ros/humble/setup.bash ]]; then
     # shellcheck disable=SC1091
-    source /opt/ros/humble/setup.bash
+    source /opt/ros/humble/setup.bash || rc=$?
   fi
   if [[ -f "${PIPER_ROS_ROOT:-/home/Light/Projects/Osw_Surf_VR/code/piper_ros}/install/setup.bash" ]]; then
     # shellcheck disable=SC1090
-    source "${PIPER_ROS_ROOT:-/home/Light/Projects/Osw_Surf_VR/code/piper_ros}/install/setup.bash"
+    source "${PIPER_ROS_ROOT:-/home/Light/Projects/Osw_Surf_VR/code/piper_ros}/install/setup.bash" || rc=$?
   fi
   set -u
+  set -e
+  if [[ "${rc}" != "0" ]]; then
+    echo "WARNING: ROS setup returned ${rc}; starting Web service anyway." >&2
+  fi
 }
 
 ensure_frontend_build() {
