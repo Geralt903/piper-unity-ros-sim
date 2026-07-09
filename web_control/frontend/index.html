@@ -116,6 +116,26 @@
                 <button type="button" data-grasp-mode="side" role="tab">侧面抓取</button>
                 <button type="button" data-grasp-mode="z_parallel" role="tab">斜向抓取</button>
               </div>
+              <div class="grasp-control-panel">
+                <div class="toggle-row grasp-toggle-row">
+                  <label><input id="lockGraspOrientation" type="checkbox" checked /><span>锁定抓取姿态</span></label>
+                </div>
+                <div class="compact-fields orientation-fields" id="graspOrientationFields"></div>
+                <div class="compact-fields pick-fields">
+                  <label>接近高度<input id="pickApproach" type="number" min="0" max="0.5" step="0.005" value="0.1" /><span>m</span></label>
+                  <label>下降距离<input id="pickDescend" type="number" min="0" max="0.5" step="0.005" value="0.05" /><span>m</span></label>
+                  <label>夹持等待<input id="pickHold" type="number" min="0" max="5" step="0.1" value="0.2" /><span>s</span></label>
+                  <label>抬起高度<input id="pickLift" type="number" min="0" max="0.5" step="0.005" value="0.1" /><span>m</span></label>
+                </div>
+                <div class="command-row secondary">
+                  <button class="button" id="approachButton" type="button"><i data-lucide="corner-down-left"></i><span>接近姿态</span></button>
+                  <button class="button primary" id="graspButton" type="button"><i data-lucide="grab"></i><span>抓取闭合</span></button>
+                </div>
+                <div class="command-row secondary">
+                  <button class="button" id="liftButton" type="button"><i data-lucide="arrow-up-from-line"></i><span>抬起</span></button>
+                  <button class="button execute" id="autoPickButton" type="button"><i data-lucide="wand-sparkles"></i><span>自动夹取</span></button>
+                </div>
+              </div>
               <div class="decision-preview compact" id="activeDecisionPreview" aria-live="polite"></div>
               <div class="workspace-bounds-panel" id="workspaceBoundsFields"></div>
               <button class="button wide" id="saveWorkspaceBoundsButton" type="button"><i data-lucide="box"></i><span>保存工作区边界</span></button>

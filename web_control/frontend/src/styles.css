@@ -366,6 +366,26 @@ button {
   font-size: 11px;
 }
 
+.grasp-control-panel {
+  display: grid;
+  margin-top: 10px;
+  gap: 8px;
+}
+
+.grasp-toggle-row {
+  grid-template-columns: 1fr;
+  margin: 0;
+}
+
+.orientation-fields {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 0;
+}
+
+.pick-fields {
+  margin-bottom: 0;
+}
+
 .decision-preview {
   display: grid;
   gap: 8px;

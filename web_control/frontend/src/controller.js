@@ -47,6 +47,12 @@ const POSE_FIELDS = [
   ['z', 'Z', 0.02, 0.85, 0.001, 0.350]
 ];
 
+const GRASP_ORIENTATION_FIELDS = [
+  ['roll', 'Roll', -180, 180, 1],
+  ['pitch', 'Pitch', -180, 180, 1],
+  ['yaw', 'Yaw', -180, 180, 1]
+];
+
 const CAMERA_FIELDS = [
   ['x', 'X', -2, 2, 0.001, 0],
   ['y', 'Y', -2, 2, 0.001, 0],
@@ -79,6 +85,10 @@ const ACTION_LABELS = {
   wait: '等待'
 };
 const DEFAULT_GRASP_POSE_MODE = 'side';
+const RAD_TO_DEG = 180 / Math.PI;
+const DEG_TO_RAD = Math.PI / 180;
+const GRASP_ORIENTATION_STORAGE_KEY = 'piper.graspOrientation';
+const GRASP_ORIENTATION_LOCK_STORAGE_KEY = 'piper.lockGraspOrientation';
 const GRASP_POSE_DEFAULTS = {
   vertical: { roll: 0, pitch: -Math.PI / 2, yaw: Math.PI, grasp_orientation_mode: 'vertical_grasp' },
   side: { roll: Math.PI / 2, pitch: 0, yaw: 0, grasp_orientation_mode: 'side_grasp' },
@@ -187,6 +197,8 @@ const state = {
   },
   lastStatusAt: 0
 };
+state.graspOrientation = loadSavedGraspOrientation(state.graspPoseMode);
+state.lockGraspOrientation = localStorage.getItem(GRASP_ORIENTATION_LOCK_STORAGE_KEY) !== 'false';
 
 let scene;
 const heldJogKeys = new Set();
@@ -197,6 +209,7 @@ let benchmarkProgressTimer = null;
 
 export function startApp() {
   buildPoseFields();
+  buildGraspOrientationFields();
   buildCameraFields();
   bindRange('velocityScaling', 'velocityValue', value => Number(value).toFixed(2));
   bindRange('accelerationScaling', 'accelerationValue', value => Number(value).toFixed(2));
@@ -319,6 +332,17 @@ function buildPoseFields() {
   }
 }
 
+function buildGraspOrientationFields() {
+  const root = byId('graspOrientationFields');
+  if (!root) return;
+  root.innerHTML = GRASP_ORIENTATION_FIELDS.map(([id, label, min, max, step]) => `
+    <label>${label}<input id="grasp_${id}" type="number" min="${min}" max="${max}" step="${step}" /><span>deg</span></label>
+  `).join('');
+  const lock = byId('lockGraspOrientation');
+  if (lock) lock.checked = state.lockGraspOrientation;
+  setGraspOrientation(state.graspOrientation, { persist: false });
+}
+
 function updatePoseOutput(id) {
   const output = byId(`pose_${id}_value`);
   if (output) output.textContent = formatNumber(Number(byId(`pose_${id}`).value), 3);
@@ -426,6 +450,7 @@ function normalizeGraspPoseMode(mode) {
 function setGraspPoseMode(mode) {
   state.graspPoseMode = normalizeGraspPoseMode(mode);
   localStorage.setItem('piper.graspPoseMode', state.graspPoseMode);
+  setGraspOrientation(GRASP_POSE_DEFAULTS[state.graspPoseMode]);
   updateGraspPoseModeUi();
   renderDecisionPreview();
   scene?.setTargetPose(readPose());
@@ -444,6 +469,10 @@ function bindCommands() {
   on('syncTcpButton', 'click', syncTargetToTcp);
   on('planButton', 'click', planMotion);
   on('executeButton', 'click', executePlan);
+  on('approachButton', 'click', () => runArmAction('approach'));
+  on('graspButton', 'click', () => runArmAction('grasp'));
+  on('liftButton', 'click', () => runArmAction('lift'));
+  on('autoPickButton', 'click', runAutoPick);
   on('readVisionButton', 'click', () => readVisionTarget(true));
   on('savePointQuickButton', 'click', savePoint);
   on('savePointButton', 'click', savePoint);
@@ -466,6 +495,8 @@ function bindCommands() {
   on('saveCollisionBoxesButton', 'click', saveManualCollisionConfig);
   on('applyCollisionBoxesButton', 'click', applyManualCollisionConfig);
   on('clearCollisionBoxesButton', 'click', clearManualCollisionConfig);
+  on('graspOrientationFields', 'input', handleGraspOrientationInput);
+  on('lockGraspOrientation', 'change', handleGraspOrientationLock);
   on('manualCollisionFields', 'input', handleManualCollisionInput);
   on('manualCollisionFields', 'change', handleManualCollisionInput);
   on('manualCollisionFields', 'click', handleManualCollisionClick);
@@ -628,7 +659,8 @@ async function requestJointJog(joint, direction) {
 function readPose() {
   const pose = Object.fromEntries(POSE_FIELDS.map(([id]) => [id, Number(byId(`pose_${id}`).value)]));
   const mode = normalizeGraspPoseMode(state.graspPoseMode);
-  const orientation = GRASP_POSE_DEFAULTS[mode];
+  const orientation = readGraspOrientation();
+  const lockOrientation = isGraspOrientationLocked();
   const request = {
     ...pose,
     roll: orientation.roll,
@@ -637,12 +669,12 @@ function readPose() {
     arm: state.arm,
     velocity_scaling: Number(byId('velocityScaling').value),
     acceleration_scaling: Number(byId('accelerationScaling').value),
-    orientation_tolerance: 0.5,
+    orientation_tolerance: lockOrientation ? 0.28 : 0.5,
     stay_near: false,
     avoid_platform: byId('avoidPlatform').checked,
     collision_boxes: currentManualCollisionBoxes(),
-    grasp_orientation_mode: orientation.grasp_orientation_mode,
-    position_only: true,
+    grasp_orientation_mode: GRASP_POSE_DEFAULTS[mode].grasp_orientation_mode,
+    position_only: !lockOrientation,
     ...readOmplRuntimeConfig()
   };
   return request;
@@ -664,7 +696,87 @@ function setPose(pose) {
       updatePoseOutput(id);
     }
   }
+  const poseMode = modeFromGraspOrientationMode(pose?.grasp_orientation_mode);
+  if (poseMode) {
+    state.graspPoseMode = poseMode;
+    localStorage.setItem('piper.graspPoseMode', state.graspPoseMode);
+    updateGraspPoseModeUi();
+  }
+  if (['roll', 'pitch', 'yaw'].some(key => Number.isFinite(Number(pose?.[key])))) {
+    setGraspOrientation(pose);
+  }
   scene?.setTargetPose(readPose());
+}
+
+function readGraspOrientation() {
+  const fallback = state.graspOrientation || GRASP_POSE_DEFAULTS[normalizeGraspPoseMode(state.graspPoseMode)];
+  const values = {};
+  for (const [id] of GRASP_ORIENTATION_FIELDS) {
+    const valueDeg = Number(byId(`grasp_${id}`)?.value);
+    values[id] = Number.isFinite(valueDeg) ? valueDeg * DEG_TO_RAD : fallback[id];
+  }
+  return values;
+}
+
+function setGraspOrientation(orientation, options = {}) {
+  const next = {
+    roll: finiteUiNumber(orientation?.roll, GRASP_POSE_DEFAULTS[normalizeGraspPoseMode(state.graspPoseMode)].roll),
+    pitch: finiteUiNumber(orientation?.pitch, GRASP_POSE_DEFAULTS[normalizeGraspPoseMode(state.graspPoseMode)].pitch),
+    yaw: finiteUiNumber(orientation?.yaw, GRASP_POSE_DEFAULTS[normalizeGraspPoseMode(state.graspPoseMode)].yaw)
+  };
+  state.graspOrientation = next;
+  for (const [id] of GRASP_ORIENTATION_FIELDS) {
+    const input = byId(`grasp_${id}`);
+    if (input) input.value = formatNumber(next[id] * RAD_TO_DEG, 1);
+  }
+  if (options.persist !== false) persistGraspOrientation();
+}
+
+function handleGraspOrientationInput() {
+  state.graspOrientation = readGraspOrientation();
+  persistGraspOrientation();
+  renderDecisionPreview();
+  scene?.setTargetPose(readPose());
+}
+
+function handleGraspOrientationLock() {
+  state.lockGraspOrientation = isGraspOrientationLocked();
+  localStorage.setItem(GRASP_ORIENTATION_LOCK_STORAGE_KEY, String(state.lockGraspOrientation));
+  renderDecisionPreview();
+  scene?.setTargetPose(readPose());
+}
+
+function isGraspOrientationLocked() {
+  const input = byId('lockGraspOrientation');
+  return input ? input.checked : state.lockGraspOrientation !== false;
+}
+
+function persistGraspOrientation() {
+  localStorage.setItem(GRASP_ORIENTATION_STORAGE_KEY, JSON.stringify(state.graspOrientation));
+}
+
+function loadSavedGraspOrientation(mode) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(GRASP_ORIENTATION_STORAGE_KEY) || '{}');
+    if (['roll', 'pitch', 'yaw'].every(key => Number.isFinite(Number(saved[key])))) {
+      return { roll: Number(saved.roll), pitch: Number(saved.pitch), yaw: Number(saved.yaw) };
+    }
+  } catch {
+    // Fall back to the selected grasp mode default.
+  }
+  const normalized = normalizeGraspPoseMode(mode);
+  return {
+    roll: GRASP_POSE_DEFAULTS[normalized].roll,
+    pitch: GRASP_POSE_DEFAULTS[normalized].pitch,
+    yaw: GRASP_POSE_DEFAULTS[normalized].yaw
+  };
+}
+
+function modeFromGraspOrientationMode(mode) {
+  if (mode === 'vertical_grasp') return 'vertical';
+  if (mode === 'side_grasp') return 'side';
+  if (mode === 'angled_grasp' || mode === 'z_parallel_grasp') return 'z_parallel';
+  return null;
 }
 
 function readCameraExtrinsic() {

@@ -277,7 +277,11 @@ class PiperWebBridge(Node if rclpy is not None else object):
             "z": float(msg.pose.orientation.z),
             "w": float(msg.pose.orientation.w),
         }
-        roll, pitch, yaw = quat_to_rpy(q)
+        if q["w"] == 0.0:
+            roll, pitch, yaw = q["x"], q["y"], q["z"]
+            q = quat_from_rpy(roll, pitch, yaw)
+        else:
+            roll, pitch, yaw = quat_to_rpy(q)
         with self._lock:
             self._link_pose = {
                 "ok": True,
@@ -661,6 +665,149 @@ class PiperWebBridge(Node if rclpy is not None else object):
         log_event("INFO", "Piper trajectory executed", {"error_code": error_code})
         return {"ok": error_code == 0, "error_code": error_code, "plan": plan}
 
+    def _pose_from_body(self, body):
+        pose = body.get("pose") if isinstance(body.get("pose"), dict) else body
+        result = dict(pose or {})
+        result.setdefault("x", finite_float(body.get("x"), 0.3))
+        result.setdefault("y", finite_float(body.get("y"), 0.0))
+        result.setdefault("z", finite_float(body.get("z"), 0.35))
+        result.setdefault("arm", "right")
+        result.setdefault("velocity_scaling", finite_float(body.get("velocity_scaling"), 0.05))
+        result.setdefault("acceleration_scaling", finite_float(body.get("acceleration_scaling"), 0.05))
+        result.setdefault("planning_time", finite_float(body.get("planning_time"), OMPL_DEFAULT["planning_time"]))
+        result.setdefault("attempts", int(finite_float(body.get("attempts"), OMPL_DEFAULT["attempts"])))
+        result.setdefault("planner_id", body.get("planner_id", OMPL_DEFAULT["planner_id"]))
+        result.setdefault("orientation_tolerance", finite_float(body.get("orientation_tolerance"), 0.35))
+        result.setdefault("position_tolerance", finite_float(body.get("position_tolerance"), 0.006))
+        result.setdefault("position_only", False)
+        result.setdefault("grasp_orientation_mode", body.get("grasp_orientation_mode", "custom_grasp"))
+        return result
+
+    def _current_link_pose_body(self):
+        with self._lock:
+            link_pose = copy.deepcopy(self._link_pose)
+        if not link_pose or not link_pose.get("pose"):
+            raise RuntimeError(f"waiting for {END_POSE_TOPIC}")
+        pose = dict(link_pose["pose"])
+        pose.setdefault("grasp_orientation_mode", "current_tcp")
+        return pose
+
+    def _plan_and_execute_pose(self, body, label):
+        plan_result = self.plan_pose(body)
+        execute_result = self.execute_last_plan({})
+        if not execute_result.get("ok"):
+            raise RuntimeError(f"{label} execute failed: error_code={execute_result.get('error_code')}")
+        return {"ok": True, "plan": plan_result.get("plan"), "execute": execute_result}
+
+    def approach_pose(self, body):
+        target = self._pose_from_body(body)
+        offset_z = clamp(finite_float(body.get("offset_z", body.get("approach_height", 0.1)), 0.1), 0.0, 0.5)
+        target["z"] = finite_float(target.get("z"), 0.35) + offset_z
+        result = self._plan_and_execute_pose(target, "approach")
+        result["approach_pose"] = {"x": target["x"], "y": target["y"], "z": target["z"], "offset_z": offset_z}
+        with self._lock:
+            self._status["right"] = "approached"
+        log_event("INFO", "Piper approach executed", result["approach_pose"])
+        return result
+
+    def grasp_pose(self, body):
+        target = self._pose_from_body(body)
+        result = self._plan_and_execute_pose(target, "grasp")
+        gripper = self.set_gripper({
+            "action": "close",
+            "opening_m": body.get("opening_m", GRIPPER_CLOSED_METERS),
+            "effort": body.get("effort", 1.0),
+        })
+        time.sleep(0.2)
+        result["gripper"] = gripper
+        with self._lock:
+            self._status["right"] = "grasped"
+        log_event("INFO", "Piper grasp executed", {"target": result.get("plan", {}).get("target"), "gripper": gripper})
+        return result
+
+    def lift_pose(self, body):
+        if isinstance(body.get("pose"), dict):
+            target = self._pose_from_body(body)
+        else:
+            target = self._current_link_pose_body()
+            target.update({
+                "velocity_scaling": finite_float(body.get("velocity_scaling"), 0.05),
+                "acceleration_scaling": finite_float(body.get("acceleration_scaling"), 0.05),
+                "planning_time": finite_float(body.get("planning_time"), OMPL_DEFAULT["planning_time"]),
+                "attempts": int(finite_float(body.get("attempts"), OMPL_DEFAULT["attempts"])),
+                "planner_id": body.get("planner_id", OMPL_DEFAULT["planner_id"]),
+                "position_only": True,
+            })
+        offset_z = clamp(finite_float(body.get("offset_z", body.get("lift_height", 0.1)), 0.1), 0.0, 0.5)
+        target["z"] = finite_float(target.get("z"), 0.35) + offset_z
+        result = self._plan_and_execute_pose(target, "lift")
+        result["lift_pose"] = {"x": target["x"], "y": target["y"], "z": target["z"], "offset_z": offset_z}
+        with self._lock:
+            self._status["right"] = "lifted"
+        log_event("INFO", "Piper lift executed", result["lift_pose"])
+        return result
+
+    def place_pose(self, body):
+        target = self._pose_from_body(body)
+        result = self._plan_and_execute_pose(target, "place")
+        result["gripper"] = self.set_gripper({"action": "open", "effort": body.get("effort", 1.0)})
+        with self._lock:
+            self._status["right"] = "placed"
+        log_event("INFO", "Piper place executed", {"target": result.get("plan", {}).get("target")})
+        return result
+
+    def pick_pose(self, body):
+        pose = self._pose_from_body(body)
+        approach_height = finite_float(body.get("approach_height"), 0.1)
+        lift_height = finite_float(body.get("lift_height"), 0.1)
+        hold_seconds = clamp(finite_float(body.get("hold_seconds"), 0.2), 0.0, 5.0)
+
+        results = []
+        results.append({"step": "open", "result": self.set_gripper({"action": "open", "effort": body.get("effort", 1.0)})})
+        results.append({"step": "approach", "result": self.approach_pose({"pose": pose, "offset_z": approach_height})})
+        results.append({"step": "grasp", "result": self.grasp_pose({"pose": pose, "effort": body.get("effort", 1.0)})})
+        if hold_seconds > 0:
+            time.sleep(hold_seconds)
+            results.append({"step": "hold", "result": {"ok": True, "seconds": hold_seconds}})
+        results.append({"step": "lift", "result": self.lift_pose({"offset_z": lift_height})})
+        with self._lock:
+            self._status["right"] = "picked"
+        log_event("INFO", "Piper pick sequence executed", {"steps": [item["step"] for item in results]})
+        return {"ok": True, "steps": results}
+
+    def execute_sequence(self, body):
+        steps = body.get("steps", [])
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("动作序列为空")
+        results = []
+        for index, step in enumerate(steps, start=1):
+            kind = str(step.get("type", "")).lower()
+            if kind == "approach":
+                result = self.approach_pose(step)
+            elif kind == "grasp":
+                result = self.grasp_pose(step)
+            elif kind == "lift":
+                result = self.lift_pose(step)
+            elif kind in {"move", "place"}:
+                result = self.place_pose(step) if kind == "place" else self._plan_and_execute_pose(self._pose_from_body(step), "move")
+            elif kind in {"release", "open"}:
+                result = self.set_gripper({"action": "open", "effort": step.get("effort", 1.0)})
+            elif kind in {"close", "gripper_close"}:
+                result = self.set_gripper({"action": "close", "effort": step.get("effort", 1.0)})
+            elif kind == "pick":
+                result = self.pick_pose(step)
+            elif kind == "wait":
+                seconds = clamp(finite_float(step.get("seconds"), 1.0), 0.0, 30.0)
+                time.sleep(seconds)
+                result = {"ok": True, "seconds": seconds}
+            else:
+                raise ValueError(f"未知动作步骤: {kind or index}")
+            results.append({"index": index, "type": kind, "result": result})
+        with self._lock:
+            self._status["right"] = "sequence done"
+        log_event("INFO", "Piper sequence executed", {"count": len(results)})
+        return {"ok": True, "steps": results}
+
 
 BRIDGE = None
 
@@ -1034,8 +1181,18 @@ class Handler(BaseHTTPRequestHandler):
             current[arm] = body.get("bounds", body)
             write_json_file(WORKSPACE_BOUNDS_FILE, current)
             self._send_json(workspace_bounds_response())
-        elif path in ("/api/approach", "/api/grasp", "/api/lift", "/api/place", "/api/pick", "/api/sequence"):
-            self._send_json(disabled_feature(path), 501)
+        elif path == "/api/approach":
+            self._send_json(require_bridge().approach_pose(body))
+        elif path == "/api/grasp":
+            self._send_json(require_bridge().grasp_pose(body))
+        elif path == "/api/lift":
+            self._send_json(require_bridge().lift_pose(body))
+        elif path == "/api/place":
+            self._send_json(require_bridge().place_pose(body))
+        elif path == "/api/pick":
+            self._send_json(require_bridge().pick_pose(body))
+        elif path == "/api/sequence":
+            self._send_json(require_bridge().execute_sequence(body))
         elif path in ("/api/joint_config", "/api/kinematics", "/api/camera_extrinsic", "/api/scene_pointcloud/save"):
             self._send_json({"ok": True, "message": "Piper Unity 第一版保留该配置接口，但不写入外部配置"})
         elif path in ("/api/benchmark/generate", "/api/benchmark/run", "/api/benchmark/export_csv"):
