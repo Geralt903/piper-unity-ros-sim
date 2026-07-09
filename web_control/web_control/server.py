@@ -100,8 +100,11 @@ def log_event(level, message, data=None):
     }
     if data is not None:
         record["data"] = data
-    with LOG_FILE.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def recent_logs(limit=200):
