@@ -23,6 +23,11 @@ EOF
 }
 
 source_ros() {
+  if [[ "${WEB_CONTROL_SKIP_ROS_SOURCE:-0}" == "1" ]]; then
+    echo "WARNING: WEB_CONTROL_SKIP_ROS_SOURCE=1; starting without sourcing ROS setup." >&2
+    return
+  fi
+
   local rc=0
   set +e
   set +u
